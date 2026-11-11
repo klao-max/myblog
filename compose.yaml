@@ -1,0 +1,20 @@
+services:
+  myblog:
+    build: .
+    container_name: myblog
+    ports:
+      - "8001:8000"
+    environment:
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-this-password}
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-session-secret}
+      PORT: 8000
+      DATA_DIR: /data
+    volumes:
+      - myblog_data:/data
+    restart: unless-stopped
+
+volumes:
+  myblog_data:
+
+
