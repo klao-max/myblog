@@ -7,8 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=/data
 
 COPY . /app
-RUN mkdir -p /data
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser \
+    && mkdir -p /data \
+    && chown -R appuser:appgroup /app /data
 
 VOLUME ["/data"]
 EXPOSE 8000
+USER appuser
 CMD ["python", "app.py"]

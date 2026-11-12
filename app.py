@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -22,10 +23,81 @@ DB_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "blog.db"))
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "0.0.0.0")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123!")
-SESSION_SECRET = os.getenv("SESSION_SECRET", "local-development-secret")
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+
+MAX_BODY_BYTES = 256 * 1024
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_ATTEMPTS = 10
 
 SESSIONS: dict[str, dict[str, str]] = {}
+LOGIN_FAILURES: dict[str, list[float]] = {}
+
+
+class RequestTooLarge(ValueError):
+    pass
+
+
+def validate_runtime_config(environment: str, admin_password: str | None, session_secret: str | None) -> None:
+    if not admin_password or not session_secret:
+        raise ValueError("ADMIN_PASSWORD and SESSION_SECRET are required")
+    if environment == "production" and admin_password in {"admin123!", "change-this-password"}:
+        raise ValueError("a non-default ADMIN_PASSWORD is required in production")
+    if environment == "production" and session_secret in {"local-development-secret", "change-this-session-secret"}:
+        raise ValueError("a non-default SESSION_SECRET is required in production")
+
+
+def _session_signature(token: str) -> str:
+    if not SESSION_SECRET:
+        raise ValueError("SESSION_SECRET is not configured")
+    return hmac.new(SESSION_SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+def build_session_cookie(token: str, environment: str | None = None) -> str:
+    environment = environment or APP_ENV
+    value = f"{token}.{_session_signature(token)}"
+    flags = "Path=/; HttpOnly; SameSite=Lax"
+    if environment == "production":
+        flags += "; Secure"
+    return f"signal_session={value}; {flags}"
+
+
+def clear_session_cookie(environment: str | None = None) -> str:
+    flags = "Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    if (environment or APP_ENV) == "production":
+        flags += "; Secure"
+    return f"signal_session=; {flags}"
+
+
+def verify_session_cookie(value: str) -> str | None:
+    try:
+        token, signature = value.rsplit(".", 1)
+    except ValueError:
+        return None
+    if not hmac.compare_digest(signature, _session_signature(token)):
+        return None
+    return token
+
+
+def _login_attempts(ip: str, now: float | None = None) -> list[float]:
+    now = now if now is not None else time.time()
+    attempts = [stamp for stamp in LOGIN_FAILURES.get(ip, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+    LOGIN_FAILURES[ip] = attempts
+    return attempts
+
+
+def record_login_failure(ip: str, now: float | None = None) -> None:
+    now = now if now is not None else time.time()
+    _login_attempts(ip, now).append(now)
+
+
+def clear_login_failures(ip: str) -> None:
+    LOGIN_FAILURES.pop(ip, None)
+
+
+def is_login_rate_limited(ip: str, now: float | None = None) -> bool:
+    return len(_login_attempts(ip, now)) >= LOGIN_MAX_ATTEMPTS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS admins (
@@ -111,6 +183,16 @@ def password_matches(password: str, stored: str) -> bool:
     return hmac.compare_digest(candidate, digest)
 
 
+def rotate_admin_password(conn: sqlite3.Connection, username: str, current_password: str, new_password: str) -> None:
+    if len(new_password) < 12:
+        raise ValueError("新密码至少需要 12 个字符")
+    row = conn.execute("SELECT id, password_hash FROM admins WHERE username = ?", (username,)).fetchone()
+    if not row or not password_matches(current_password, row["password_hash"]):
+        raise ValueError("当前密码不正确")
+    conn.execute("UPDATE admins SET password_hash = ? WHERE id = ?", (password_hash(new_password), row["id"]))
+    conn.commit()
+
+
 def seed(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     admin = cur.execute("SELECT id FROM admins WHERE username = ?", (ADMIN_USERNAME,)).fetchone()
@@ -175,6 +257,38 @@ def esc(value: object) -> str:
 def slugify(text: str) -> str:
     value = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", text.strip().lower()).strip("-")
     return value or f"entry-{secrets.token_hex(3)}"
+
+
+def validate_slug(value: str) -> str:
+    value = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9\u4e00-\u9fff]+(?:-[a-z0-9\u4e00-\u9fff]+)*", value):
+        raise ValueError("slug 只能包含字母、数字、中文和连字符")
+    return value
+
+
+def validate_external_url(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("外链必须使用 http 或 https")
+    return value
+
+
+def next_published_at(previous_status: str, previous_published_at: str | None, new_status: str, timestamp: str) -> str | None:
+    if new_status != "published":
+        return None
+    if previous_status == "published" and previous_published_at:
+        return previous_published_at
+    return timestamp
+
+
+def validate_game_bundle(slug: str, status: str) -> str:
+    slug = validate_slug(slug)
+    if status == "published" and not (ROOT / "games" / slug / "index.html").is_file():
+        raise ValueError("已发布游戏必须存在 games/<slug>/index.html")
+    return slug
 
 
 def fmt_date(value: str | None) -> str:
@@ -263,7 +377,7 @@ def render_page(title: str, content: str, *, admin: bool = False, active: str = 
     if admin:
         nav = f"""
         <header class=\"admin-top\"><a class=\"brand brand-admin\" href=\"/admin\"><span class=\"brand-dot\"></span>个人工作台</a>
-        <div class=\"admin-top-actions\"><a class=\"quiet-link\" href=\"/\" target=\"_blank\">查看站点 ↗</a><form method=\"post\" action=\"/admin/logout\"><button class=\"button button-ghost\">退出</button></form></div></header>
+        <div class=\"admin-top-actions\"><a class=\"quiet-link\" href=\"/admin/password\">修改密码</a><a class=\"quiet-link\" href=\"/\" target=\"_blank\">查看站点 ↗</a><form method=\"post\" action=\"/admin/logout\"><button class=\"button button-ghost\">退出</button></form></div></header>
         <div class=\"admin-layout\"><aside class=\"admin-rail\"><p class=\"rail-label\">工作区</p>
         <a class=\"rail-link {"is-active" if active == "overview" else ""}\" href=\"/admin\">概览</a>
         <a class=\"rail-link {"is-active" if active == "posts" else ""}\" href=\"/admin/posts\">文章 <span>⌘</span></a>
@@ -323,7 +437,7 @@ def listing(conn: sqlite3.Connection, kind: str) -> str:
 def detail(conn: sqlite3.Connection, kind: str, slug: str) -> tuple[int, str]:
     table = {"blog": "posts", "projects": "projects", "games": "games"}[kind]
     row = conn.execute(f"SELECT * FROM {table} WHERE slug = ?", (slug,)).fetchone()
-    if not row or (kind == "blog" and row["status"] != "published") or (kind == "games" and row["status"] != "published"):
+    if not row or (kind == "blog" and row["status"] != "published") or (kind == "games" and row["status"] != "published") or (kind == "projects" and row["status"] == "archived"):
         return 404, render_page("找不到内容", '<main class="subpage wrap"><div class="empty-state large"><p>这条内容不存在，或者还在草稿箱里。</p><a class="button button-primary" href="/">回到首页</a></div></main>')
     if kind == "blog":
         body = f"""<main class=\"article-page wrap\"><a class=\"back-link\" href=\"/blog\">← 返回文章</a><div class=\"article-head\"><p class=\"kicker\">{fmt_date(row['published_at'])} · {" / ".join(tags(row['tags']))}</p><h1>{esc(row['title'])}</h1><p class=\"article-lead\">{esc(row['excerpt'])}</p></div><article class=\"article-body\">{markdown(row['body'])}</article></main>"""
@@ -375,12 +489,12 @@ def admin_list(conn: sqlite3.Connection, kind: str) -> str:
     return render_page(f"管理{title}", content, admin=True, active=kind)
 
 
-def form_input(label: str, name: str, value: str = "", *, required: bool = False, placeholder: str = "", textarea: bool = False, rows: int = 8) -> str:
+def form_input(label: str, name: str, value: str = "", *, required: bool = False, placeholder: str = "", textarea: bool = False, rows: int = 8, input_type: str = "text") -> str:
     req = " required" if required else ""
     if textarea:
         control = f'<textarea id="{name}" name="{name}" rows="{rows}" placeholder="{esc(placeholder)}"{req}>{esc(value)}</textarea>'
     else:
-        control = f'<input id="{name}" name="{name}" value="{esc(value)}" placeholder="{esc(placeholder)}"{req}>'
+        control = f'<input id="{name}" name="{name}" type="{esc(input_type)}" value="{esc(value)}" placeholder="{esc(placeholder)}"{req}>'
     return f'<label class="field"><span>{esc(label)}</span>{control}</label>'
 
 
@@ -413,6 +527,13 @@ def edit_form(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, kind: s
     return render_page(f"{'编辑' if not is_new else '新建'}{prefix}", f"""<div class=\"admin-heading compact\"><div><p class=\"kicker\">WORKSPACE / {kind.upper()}</p><h1>{'编辑' if not is_new else '新建'}{prefix}</h1><p>{hint}</p></div><a class=\"quiet-link\" href=\"/admin/{kind}\">← 返回列表</a></div><form class=\"editor-form\" method=\"post\" action=\"{action}\">{csrf_for(handler)}{f'<input type="hidden" name="id" value="{row["id"]}">' if not is_new else ''}<div class=\"form-main\">{fields}</div><aside class=\"form-aside\"><div class=\"save-card\"><p>发布动作</p><strong>{'更新已有内容' if not is_new else '保存为草稿'}</strong><button class=\"button button-primary button-wide\" type=\"submit\">保存{prefix} <span>↗</span></button><p class=\"form-help\">保存后可在公开站点检查结果。</p></div></aside></form>""", admin=True, active=kind)
 
 
+def parse_form_data(data: str, length: int) -> dict[str, str]:
+    if length > MAX_BODY_BYTES:
+        raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
+    parsed = parse_qs(data, keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items()}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SignalDesk/0.1"
 
@@ -420,7 +541,8 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {fmt % args}")
 
     def session(self) -> dict[str, str]:
-        token = cookie_value(self.headers, "signal_session")
+        raw_token = cookie_value(self.headers, "signal_session")
+        token = verify_session_cookie(raw_token) if raw_token else None
         return SESSIONS.get(token, {}) if token else {}
 
     def is_admin(self) -> bool:
@@ -465,9 +587,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def parse_form(self) -> dict[str, str]:
         length = int(self.headers.get("Content-Length", "0"))
-        data = self.rfile.read(length).decode("utf-8")
-        parsed = parse_qs(data, keep_blank_values=True)
-        return {key: values[-1] for key, values in parsed.items()}
+        if length > MAX_BODY_BYTES:
+            raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
+        data = self.rfile.read(length).decode("utf-8") if length else ""
+        return parse_form_data(data, length)
+
 
     def do_GET(self) -> None:
         path = unquote(urlparse(self.path).path.rstrip("/")) or "/"
@@ -478,6 +602,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/games/") and path.endswith("/play"):
                 slug = path.split("/")[2]
+                try:
+                    slug = validate_slug(slug)
+                except ValueError:
+                    self.send_error(404)
+                    return
+                game = conn.execute("SELECT status FROM games WHERE slug = ?", (slug,)).fetchone()
+                if not game or game["status"] != "published":
+                    self.send_error(404)
+                    return
                 self.serve_file(ROOT / "games" / slug / "index.html", ROOT / "games")
                 return
             if path == "/":
@@ -498,7 +631,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/login":
                 if self.is_admin():
                     self.redirect("/admin"); return
-                self.send_html(render_page("登录后台", """<main class="login-page"><div class="login-card"><p class="kicker">SIGNAL DESK / ADMIN</p><h1>回到工作台。</h1><p>单管理员入口。发布内容之前，先确认这是你。</p><form method="post" action="/admin/login"><label class="field"><span>用户名</span><input name="username" autocomplete="username" required value="admin"></label><label class="field"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label><button class="button button-primary button-wide" type="submit">登录后台 ↗</button></form><p class="login-help">本地默认账号：admin / admin123!</p></div></main>""")); return
+                self.send_html(render_page("登录后台", """<main class="login-page"><div class="login-card"><p class="kicker">SIGNAL DESK / ADMIN</p><h1>回到工作台。</h1><p>单管理员入口。发布内容之前，先确认这是你。</p><form method="post" action="/admin/login"><label class="field"><span>用户名</span><input name="username" autocomplete="username" required value="admin"></label><label class="field"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label><button class="button button-primary button-wide" type="submit">登录后台 ↗</button></form><p class="login-help">密码由部署环境变量 ADMIN_PASSWORD 提供。</p></div></main>""")); return
+            if path == "/admin/password":
+                if not self.is_admin(): self.redirect("/admin/login"); return
+                content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / SECURITY</p><h1>修改密码</h1><p>修改后，当前登录会话仍然有效。</p></div><a class="quiet-link" href="/admin">← 返回后台</a></div><form class="editor-form" method="post" action="/admin/password">{csrf_for(self)}<div class="form-main">{form_input("当前密码", "current_password", textarea=False, input_type="password")}{form_input("新密码", "new_password", textarea=False, input_type="password")}{form_input("确认新密码", "confirm_password", textarea=False, input_type="password")}</div><aside class="form-aside"><div class="save-card"><p>安全设置</p><strong>至少 12 个字符</strong><button class="button button-primary button-wide" type="submit">更新密码 ↗</button></div></aside></form>'''
+                self.send_html(render_page("修改密码", content, admin=True, active="overview")); return
             if path == "/admin" or path == "/admin/":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_dashboard(conn)); return
@@ -524,64 +661,105 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = unquote(urlparse(self.path).path.rstrip("/")) or "/"
-        form = self.parse_form()
+        try:
+            form = self.parse_form()
+        except RequestTooLarge:
+            self.send_error(413, "请求内容过大")
+            return
         conn = db()
+        client_ip = self.client_address[0]
         try:
             if path == "/admin/login":
+                if is_login_rate_limited(client_ip):
+                    self.send_error(429, "登录尝试过多，请稍后再试")
+                    return
                 row = conn.execute("SELECT * FROM admins WHERE username = ?", (form.get("username", ""),)).fetchone()
                 if row and password_matches(form.get("password", ""), row["password_hash"]):
+                    clear_login_failures(client_ip)
                     token = secrets.token_urlsafe(32)
                     SESSIONS[token] = {"admin_id": str(row["id"]), "csrf": secrets.token_urlsafe(24)}
-                    self.redirect("/admin", cookie=f"signal_session={token}; Path=/; HttpOnly; SameSite=Lax")
+                    self.redirect("/admin", cookie=build_session_cookie(token))
                 else:
+                    record_login_failure(client_ip)
                     self.send_html(render_page("登录失败", """<main class="login-page"><div class="login-card"><p class="kicker">SIGNAL DESK / ADMIN</p><h1>密码不对。</h1><p class="error-copy">请重新输入管理员账号和密码。</p><a class="button button-primary button-wide" href="/admin/login">返回登录</a></div></main>"""), 401)
                 return
             if path == "/admin/logout":
-                token = cookie_value(self.headers, "signal_session")
-                if token: SESSIONS.pop(token, None)
-                self.redirect("/", cookie="signal_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+                raw_token = cookie_value(self.headers, "signal_session")
+                token = verify_session_cookie(raw_token) if raw_token else None
+                if token:
+                    SESSIONS.pop(token, None)
+                self.redirect("/", cookie=clear_session_cookie())
                 return
             if not self.is_admin():
                 self.redirect("/admin/login"); return
             if form.get("csrf") != self.session().get("csrf"):
                 self.send_html(render_page("请求失效", '<main class="subpage wrap"><div class="empty-state large"><p>编辑会话已失效，请返回后台重试。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 403); return
+            if path == "/admin/password":
+                if form.get("new_password") != form.get("confirm_password"):
+                    raise ValueError("两次输入的新密码不一致")
+                username = ADMIN_USERNAME or "admin"
+                rotate_admin_password(conn, username, form.get("current_password", ""), form.get("new_password", ""))
+                self.redirect("/admin")
+                return
             m = re.match(r"^/admin/(posts|projects|games)/save$", path)
             if m:
                 kind = m.group(1)
-                table = kind
                 data = dict(form)
                 data["slug"] = data.get("slug") or slugify(data.get("title") or data.get("name") or "entry")
                 data["featured"] = 1 if form.get("featured") == "on" else 0
                 timestamp = now_iso()
                 if kind == "posts":
+                    status = data.get("status", "draft")
+                    if status not in {"draft", "published"}:
+                        raise ValueError("文章状态无效")
+                    data["slug"] = validate_slug(data["slug"])
                     columns = ["title", "slug", "excerpt", "body", "tags", "cover", "status"]
-                    if data.get("status") == "published" and not data.get("published_at"):
-                        data["published_at"] = timestamp
                     if form.get("id"):
-                        conn.execute("UPDATE posts SET title=?, slug=?, excerpt=?, body=?, tags=?, cover=?, status=?, published_at=COALESCE(published_at, ?), updated_at=? WHERE id=?", tuple(data.get(c, "") for c in columns) + (timestamp, timestamp, form["id"]))
+                        existing = conn.execute("SELECT status, published_at FROM posts WHERE id = ?", (form["id"],)).fetchone()
+                        if not existing:
+                            raise ValueError("文章不存在")
+                        published_at = next_published_at(existing["status"], existing["published_at"], status, timestamp)
+                        conn.execute("UPDATE posts SET title=?, slug=?, excerpt=?, body=?, tags=?, cover=?, status=?, published_at=?, updated_at=? WHERE id=?", tuple(data.get(c, "") for c in columns) + (published_at, timestamp, form["id"]))
                     else:
-                        conn.execute("INSERT INTO posts(title, slug, excerpt, body, tags, cover, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(data.get(c, "") for c in columns) + (data.get("published_at"), timestamp, timestamp))
+                        published_at = timestamp if status == "published" else None
+                        conn.execute("INSERT INTO posts(title, slug, excerpt, body, tags, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(data.get(c, "") for c in columns) + (published_at, timestamp, timestamp))
                 elif kind == "projects":
+                    status = data.get("status", "active")
+                    if status not in {"active", "paused", "archived"}:
+                        raise ValueError("项目状态无效")
+                    data["slug"] = validate_slug(data["slug"])
+                    data["github_url"] = validate_external_url(data.get("github_url", ""))
+                    data["demo_url"] = validate_external_url(data.get("demo_url", ""))
+                    values = tuple(data.get(c, "") for c in ["name", "slug", "summary", "description", "tech_stack", "github_url", "demo_url", "status"])
                     if form.get("id"):
-                        conn.execute("UPDATE projects SET name=?, slug=?, summary=?, description=?, tech_stack=?, github_url=?, demo_url=?, status=?, featured=?, updated_at=? WHERE id=?", tuple(data.get(c, "") for c in ["name", "slug", "summary", "description", "tech_stack", "github_url", "demo_url", "status"]) + (data["featured"], timestamp, form["id"]))
+                        conn.execute("UPDATE projects SET name=?, slug=?, summary=?, description=?, tech_stack=?, github_url=?, demo_url=?, status=?, featured=?, updated_at=? WHERE id=?", values + (data["featured"], timestamp, form["id"]))
                     else:
-                        conn.execute("INSERT INTO projects(name, slug, summary, description, tech_stack, github_url, demo_url, status, featured, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(data.get(c, "") for c in ["name", "slug", "summary", "description", "tech_stack", "github_url", "demo_url", "status"]) + (data["featured"], timestamp, timestamp))
+                        conn.execute("INSERT INTO projects(name, slug, summary, description, tech_stack, github_url, demo_url, status, featured, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values + (data["featured"], timestamp, timestamp))
                 else:
+                    status = data.get("status", "draft")
+                    if status not in {"published", "draft"}:
+                        raise ValueError("游戏状态无效")
+                    data["slug"] = validate_game_bundle(data["slug"], status)
+                    data["source_url"] = validate_external_url(data.get("source_url", ""))
+                    values = tuple(data.get(c, "") for c in ["name", "slug", "summary", "description", "controls", "source_url", "status"])
                     if form.get("id"):
-                        conn.execute("UPDATE games SET name=?, slug=?, summary=?, description=?, controls=?, source_url=?, status=?, featured=?, updated_at=? WHERE id=?", tuple(data.get(c, "") for c in ["name", "slug", "summary", "description", "controls", "source_url", "status"]) + (data["featured"], timestamp, form["id"]))
+                        conn.execute("UPDATE games SET name=?, slug=?, summary=?, description=?, controls=?, source_url=?, status=?, featured=?, updated_at=? WHERE id=?", values + (data["featured"], timestamp, form["id"]))
                     else:
-                        conn.execute("INSERT INTO games(name, slug, summary, description, controls, source_url, status, featured, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(data.get(c, "") for c in ["name", "slug", "summary", "description", "controls", "source_url", "status"]) + (data["featured"], timestamp, timestamp))
+                        conn.execute("INSERT INTO games(name, slug, summary, description, controls, source_url, status, featured, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values + (data["featured"], timestamp, timestamp))
                 conn.commit()
                 self.redirect(f"/admin/{kind}")
                 return
             self.send_error(404)
-        except sqlite3.IntegrityError as exc:
-            self.send_html(render_page("保存失败", f'<main class="subpage wrap"><div class="empty-state large"><p>保存失败：slug 可能已经被使用。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 409)
+        except ValueError as exc:
+            self.send_html(render_page("保存失败", f'<main class="subpage wrap"><div class="empty-state large"><p>{esc(exc)}</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 400)
+        except sqlite3.IntegrityError:
+            self.send_html(render_page("保存失败", '<main class="subpage wrap"><div class="empty-state large"><p>保存失败：slug 可能已经被使用。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 409)
         finally:
             conn.close()
 
 
 def main() -> None:
+    validate_runtime_config(APP_ENV, ADMIN_PASSWORD, SESSION_SECRET)
     db().close()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Signal Desk running on http://127.0.0.1:{PORT}")

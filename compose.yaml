@@ -5,14 +5,20 @@ services:
     ports:
       - "8001:8000"
     environment:
+      APP_ENV: production
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-this-password}
-      SESSION_SECRET: ${SESSION_SECRET:-change-this-session-secret}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set}
       PORT: 8000
       DATA_DIR: /data
     volumes:
       - myblog_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   myblog_data:

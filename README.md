@@ -8,19 +8,21 @@
 
 ```powershell
 cd D:\Users\MyProject\myblog
-$env:ADMIN_PASSWORD="change-this-password"
+$env:APP_ENV="development"
+$env:ADMIN_PASSWORD="set-a-local-password"
+$env:SESSION_SECRET="set-a-local-session-secret"
 python app.py
 ```
 
-打开 <http://127.0.0.1:8001>。
+打开 <http://127.0.0.1:8000>。
 
-后台：<http://127.0.0.1:8001/admin/login>
+后台：<http://127.0.0.1:8000/admin/login>
 
-默认用户名为 `admin`，密码取环境变量 `ADMIN_PASSWORD`，未设置时开发默认值是 `admin123!`。
+用户名默认为 `admin`，密码和 session secret 取环境变量 `ADMIN_PASSWORD`、`SESSION_SECRET`。生产环境未设置这两个变量时会拒绝启动。
 
 ## 使用 Docker Desktop
 
-确保 Docker Desktop 已启动，然后在 PowerShell 执行：
+确保 Docker Desktop 已启动，并先设置 `ADMIN_PASSWORD`、`SESSION_SECRET`，然后在 PowerShell 执行：
 
 ```powershell
 cd D:\Users\MyProject\myblog
@@ -66,7 +68,6 @@ games/<slug>/index.html
 
 ## 生产环境前需要替换
 
-- 修改 `compose.yaml` 中的管理员密码和 session secret
-- 将 `SESSION_SECRET` 放到本机 `.env` 或部署平台的 secret 中
+- 将 `ADMIN_PASSWORD`、`SESSION_SECRET` 放到本机 `.env` 或部署平台的 secret 中
 - 为公网环境增加 HTTPS、反向代理和备份策略
 
