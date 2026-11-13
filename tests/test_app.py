@@ -127,6 +127,35 @@ class SignalDeskTests(unittest.TestCase):
         self.conn.commit()
         self.assertEqual([row["stored_name"] for row in app.gallery_images(self.conn)], ["a.jpg", "b.jpg"])
 
+    def test_blog_gallery_falls_back_without_images(self):
+        self.assertEqual(app.blog_gallery(self.conn), "")
+
+    def test_blog_gallery_renders_enabled_images_in_order(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("second image.jpg", "second <image>.jpg", "image/jpeg", 1, 2, 1, now),
+        )
+        self.conn.execute(
+            "INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("first image.jpg", "first image.jpg", "image/jpeg", 1, 1, 1, now),
+        )
+        self.conn.execute(
+            "INSERT INTO site_gallery_settings(id, effect, interval, updated_at) VALUES (1, ?, ?, ?)",
+            ("slide", 7, now),
+        )
+        self.conn.commit()
+
+        rendered = app.blog_gallery(self.conn)
+
+        self.assertIn('data-effect="slide"', rendered)
+        self.assertIn('data-interval="7"', rendered)
+        self.assertIn('/media/gallery/first%20image.jpg', rendered)
+        self.assertIn('/media/gallery/second%20image.jpg', rendered)
+        self.assertLess(rendered.index("first%20image.jpg"), rendered.index("second%20image.jpg"))
+        self.assertIn('class="blog-gallery__slide is-active"', rendered)
+        self.assertIn("second &lt;image&gt;.jpg", rendered)
+
 
     def _multipart(self, files, csrf="integration-csrf"):
         boundary = "----signal-test"

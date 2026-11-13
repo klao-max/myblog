@@ -465,6 +465,32 @@ def article_timeline(rows: list[sqlite3.Row]) -> str:
     return f"""<section class=\"article-timeline-section\" aria-labelledby=\"timeline-title\"><div class=\"timeline-heading\"><div><p class=\"kicker\">ARCHIVE / TIMELINE</p><h2 id=\"timeline-title\">沿着时间线回看。</h2></div><span class=\"timeline-direction\">最新 <span aria-hidden=\"true\">←</span> 早期</span></div><nav class=\"article-timeline\" aria-label=\"文章时间线\"><div class=\"timeline-scroll\"><ol class=\"timeline-track\">{items}</ol></div></nav></section>"""
 
 
+def blog_gallery(conn: sqlite3.Connection) -> str:
+    images = gallery_images(conn)
+    if not images:
+        return ""
+
+    settings = conn.execute("SELECT effect, interval FROM site_gallery_settings WHERE id = 1").fetchone()
+    effect = settings["effect"] if settings and settings["effect"] else "fade"
+    try:
+        interval = int(settings["interval"]) if settings and settings["interval"] is not None else 5
+    except (TypeError, ValueError):
+        interval = 5
+    if interval <= 0:
+        interval = 5
+
+    slides = "".join(
+        f'<figure class="blog-gallery__slide{" is-active" if index == 0 else ""}"><img src="/media/gallery/{quote(str(row["stored_name"]), safe="")}" alt="{esc(row["original_name"])}"></figure>'
+        for index, row in enumerate(images)
+    )
+    return f"""<section class="blog-gallery" data-effect="{esc(effect)}" data-interval="{interval}">
+    <div class="blog-gallery__slides" aria-label="博客背景图片">{slides}</div>
+    <div class="blog-gallery__scrim" aria-hidden="true"></div>
+    <div class="blog-gallery__content"><p class="kicker">SIGNAL DESK / BLOG</p><h1>文章</h1><p>把正在思考的事情，写成可以被重新打开的页面。</p></div>
+    <button class="blog-gallery__pause" type="button" aria-label="暂停背景轮播">暂停轮播</button>
+    </section>"""
+
+
 def home(conn: sqlite3.Connection) -> str:
     posts = conn.execute("SELECT * FROM posts WHERE status='published' ORDER BY published_at DESC, id DESC LIMIT 3").fetchall()
     projects = conn.execute("SELECT * FROM projects WHERE status != 'archived' ORDER BY featured DESC, updated_at DESC LIMIT 3").fetchall()
@@ -494,7 +520,9 @@ def listing(conn: sqlite3.Connection, kind: str) -> str:
         cards = "".join(public_card("游戏", r["name"], r["summary"], f"/games/{quote(r['slug'])}", "可玩", '<span class="play-mark">▶ 立即开始</span>') for r in rows)
         title, intro = "游戏", "一些小而完整的实验，打开浏览器就能开始。"
     timeline = article_timeline(rows) if kind == "blog" else ""
-    return render_page(title, f"""<main class=\"subpage wrap\"><div class=\"subpage-intro\"><p class=\"kicker\">SIGNAL DESK / {kind.upper()}</p><h1>{title}</h1><p>{intro}</p></div>{timeline}<div class=\"card-grid card-grid-wide\">{cards or '<p class="empty-state">这里暂时是空的，稍后会更新。</p>'}</div></main><footer class=\"site-footer wrap\"><span>Signal Desk</span><span>Keep making.</span></footer>""", active=kind)
+    visual = blog_gallery(conn) if kind == "blog" else ""
+    intro_html = visual or f'<div class="subpage-intro"><p class="kicker">SIGNAL DESK / {kind.upper()}</p><h1>{title}</h1><p>{intro}</p></div>'
+    return render_page(title, f"""<main class=\"subpage wrap\">{intro_html}{timeline}<div class=\"card-grid card-grid-wide\">{cards or '<p class="empty-state">这里暂时是空的，稍后会更新。</p>'}</div></main><footer class=\"site-footer wrap\"><span>Signal Desk</span><span>Keep making.</span></footer>""", active=kind)
 
 
 def detail(conn: sqlite3.Connection, kind: str, slug: str) -> tuple[int, str]:
