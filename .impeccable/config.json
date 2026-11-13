@@ -1,3 +1,18 @@
 {
-  "buildPath": "code"
+  "buildPath": "code",
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "static/style.css"
+        ],
+        "createdAt": "2026-11-13T10:35:55.978Z",
+        "reason": "user requested the left-pointing timeline arrow; line 595 is the arrow triangle, not a card side-tab accent"
+      }
+    ]
+  }
 }
