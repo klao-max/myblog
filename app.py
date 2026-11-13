@@ -403,6 +403,16 @@ def public_card(kind: str, title: str, summary: str, href: str, meta: str, extra
     return f"""<article class=\"content-card\"><div class=\"card-top\"><span class=\"card-kind\">{esc(kind)}</span><span class=\"card-meta\">{esc(meta)}</span></div><h3><a href=\"{href}\">{esc(title)}</a></h3><p>{esc(summary)}</p>{extra}<a class=\"text-link\" href=\"{href}\">打开内容 <span>↗</span></a></article>"""
 
 
+def article_timeline(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return ""
+    items = "".join(
+        f"""<li class=\"timeline-item\"><a class=\"timeline-entry\" href=\"/blog/{quote(row['slug'])}\"><time datetime=\"{esc(row['published_at'] or '')}\">{esc(fmt_date(row['published_at']))}</time><strong>{esc(row['title'])}</strong><span>{esc(row['excerpt'])}</span></a></li>"""
+        for row in rows
+    )
+    return f"""<section class=\"article-timeline-section\" aria-labelledby=\"timeline-title\"><div class=\"timeline-heading\"><div><p class=\"kicker\">ARCHIVE / TIMELINE</p><h2 id=\"timeline-title\">沿着时间线回看。</h2></div><span class=\"timeline-direction\">最新 <span aria-hidden=\"true\">←</span> 早期</span></div><nav class=\"article-timeline\" aria-label=\"文章时间线\"><div class=\"timeline-scroll\"><ol class=\"timeline-track\">{items}</ol></div></nav></section>"""
+
+
 def home(conn: sqlite3.Connection) -> str:
     posts = conn.execute("SELECT * FROM posts WHERE status='published' ORDER BY published_at DESC, id DESC LIMIT 3").fetchall()
     projects = conn.execute("SELECT * FROM projects WHERE status != 'archived' ORDER BY featured DESC, updated_at DESC LIMIT 3").fetchall()
@@ -431,7 +441,8 @@ def listing(conn: sqlite3.Connection, kind: str) -> str:
         rows = conn.execute("SELECT * FROM games WHERE status='published' ORDER BY featured DESC, updated_at DESC").fetchall()
         cards = "".join(public_card("游戏", r["name"], r["summary"], f"/games/{quote(r['slug'])}", "可玩", '<span class="play-mark">▶ 立即开始</span>') for r in rows)
         title, intro = "游戏", "一些小而完整的实验，打开浏览器就能开始。"
-    return render_page(title, f"""<main class=\"subpage wrap\"><div class=\"subpage-intro\"><p class=\"kicker\">SIGNAL DESK / {kind.upper()}</p><h1>{title}</h1><p>{intro}</p></div><div class=\"card-grid card-grid-wide\">{cards or '<p class="empty-state">这里暂时是空的，稍后会更新。</p>'}</div></main><footer class=\"site-footer wrap\"><span>Signal Desk</span><span>Keep making.</span></footer>""", active=kind)
+    timeline = article_timeline(rows) if kind == "blog" else ""
+    return render_page(title, f"""<main class=\"subpage wrap\"><div class=\"subpage-intro\"><p class=\"kicker\">SIGNAL DESK / {kind.upper()}</p><h1>{title}</h1><p>{intro}</p></div>{timeline}<div class=\"card-grid card-grid-wide\">{cards or '<p class="empty-state">这里暂时是空的，稍后会更新。</p>'}</div></main><footer class=\"site-footer wrap\"><span>Signal Desk</span><span>Keep making.</span></footer>""", active=kind)
 
 
 def detail(conn: sqlite3.Connection, kind: str, slug: str) -> tuple[int, str]:

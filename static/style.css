@@ -259,3 +259,190 @@ h1, h2, h3 { letter-spacing: -.055em; }
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
 
+/* Editorial article timeline: newest entries begin at the left edge. */
+.article-timeline-section {
+  margin: 66px 0 76px;
+  padding: 26px 0 0;
+  border-top: 2px solid var(--ink);
+}
+
+.timeline-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 6px;
+}
+
+.timeline-heading h2 {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  font-size: clamp(2rem, 4vw, 3.4rem);
+  font-weight: 500;
+  line-height: .96;
+}
+
+.timeline-direction {
+  padding-bottom: 7px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.article-timeline {
+  margin-top: 14px;
+}
+
+.timeline-scroll {
+  overflow-x: auto;
+  padding: 20px 0 4px;
+  scrollbar-color: var(--orange) transparent;
+  scrollbar-width: thin;
+}
+
+.timeline-track {
+  position: relative;
+  display: flex;
+  gap: 26px;
+  min-width: max-content;
+  margin: 0;
+  padding: 0 34px 50px;
+  list-style: none;
+}
+
+.timeline-track::after {
+  position: absolute;
+  right: 34px;
+  bottom: 15px;
+  left: 34px;
+  height: 2px;
+  background: var(--ink);
+  content: "";
+}
+
+.timeline-track::before {
+  position: absolute;
+  bottom: 9px;
+  left: 25px;
+  z-index: 1;
+  width: 0;
+  height: 0;
+  border-top: 7px solid transparent;
+  border-bottom: 7px solid transparent;
+  border-right: 10px solid var(--ink);
+  content: "";
+}
+
+.timeline-item {
+  position: relative;
+  width: clamp(220px, 24vw, 282px);
+  padding-bottom: 33px;
+}
+
+.timeline-item::after {
+  position: absolute;
+  bottom: 15px;
+  left: 50%;
+  width: 2px;
+  height: 27px;
+  background: var(--ink);
+  content: "";
+  transform: translateX(-50%);
+}
+
+.timeline-entry {
+  display: flex;
+  min-height: 170px;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 18px 18px 16px;
+  border: 2px solid var(--ink);
+  background: rgba(255, 255, 255, .28);
+  box-shadow: 5px 5px 0 var(--ink);
+  transition: transform .2s ease, background .2s ease, box-shadow .2s ease;
+}
+
+.timeline-entry:hover {
+  background: rgba(255, 255, 255, .56);
+  box-shadow: 8px 8px 0 var(--orange);
+  transform: translate(-2px, -3px);
+}
+
+.timeline-entry:focus-visible {
+  outline: 3px solid var(--orange-deep);
+  outline-offset: 4px;
+}
+
+.timeline-entry time {
+  margin-bottom: 28px;
+  color: var(--orange-deep);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .13em;
+}
+
+.timeline-entry strong {
+  display: block;
+  margin-bottom: 9px;
+  font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  font-size: 25px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -.04em;
+}
+
+.timeline-entry span {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: auto;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+@media (max-width: 560px) {
+  .article-timeline-section {
+    margin: 54px 0 60px;
+    padding-top: 22px;
+  }
+
+  .timeline-heading {
+    display: block;
+  }
+
+  .timeline-direction {
+    display: block;
+    margin-top: 15px;
+  }
+
+  .timeline-track {
+    gap: 18px;
+    padding-right: 26px;
+    padding-left: 26px;
+  }
+
+  .timeline-track::after {
+    right: 26px;
+    left: 26px;
+  }
+
+  .timeline-track::before {
+    left: 17px;
+  }
+
+  .timeline-item {
+    width: 226px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline-entry:hover {
+    transform: none;
+  }
+}
+

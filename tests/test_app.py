@@ -182,6 +182,24 @@ class SignalDeskTests(unittest.TestCase):
         self.conn.commit()
         self.assertNotIn("<script>", app.markdown("<script>alert(1)</script>"))
 
+    def test_blog_listing_renders_timeline_in_newest_to_oldest_order(self):
+        self.conn.executemany(
+            "INSERT INTO posts(title, slug, excerpt, body, tags, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("Older note", "older-note", "A short older excerpt", "", "notes", "published", "2026-01-02T00:00:00+00:00", "2026-01-02T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+                ("Newest note", "newest-note", "The latest excerpt", "", "build", "published", "2026-02-14T00:00:00+00:00", "2026-02-14T00:00:00+00:00", "2026-02-14T00:00:00+00:00"),
+            ],
+        )
+        self.conn.commit()
+
+        html = app.listing(self.conn, "blog")
+        timeline_html = html.split('class="article-timeline"', 1)[1].split("</nav>", 1)[0]
+
+        self.assertIn('class="article-timeline"', html)
+        self.assertIn("2026.02.14", timeline_html)
+        self.assertIn("The latest excerpt", timeline_html)
+        self.assertLess(timeline_html.index("Newest note"), timeline_html.index("Older note"))
+
 
 if __name__ == "__main__":
     unittest.main()
