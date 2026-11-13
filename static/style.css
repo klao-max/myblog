@@ -309,7 +309,7 @@ h1, h2, h3 { letter-spacing: -.055em; }
   gap: 26px;
   min-width: max-content;
   margin: 0;
-  padding: 0 34px 50px;
+  padding: 0 34px 80px;
   list-style: none;
 }
 
@@ -675,7 +675,7 @@ h1, h2, h3 { letter-spacing: -.055em; }
 
 .timeline-date {
   position: absolute;
-  bottom: 0;
+  bottom: -20px;
   left: 50%;
   z-index: 3;
   display: inline-flex;
