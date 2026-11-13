@@ -443,7 +443,8 @@ def render_page(title: str, content: str, *, admin: bool = False, active: str = 
         <nav class=\"site-nav\"><a class="{'is-active' if active == 'blog' else ''}" href=\"/blog\">文章</a><a class="{'is-active' if active == 'projects' else ''}" href=\"/projects\">项目</a><a class="{'is-active' if active == 'games' else ''}" href=\"/games\">游戏</a><a href=\"/about\">关于</a></nav></header>
         """
     body_class = "admin-body" if admin else "public-body"
-    return f"""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"description\" content=\"个人博客、项目和浏览器游戏\"><title>{esc(title)} · Signal Desk</title><link rel=\"stylesheet\" href=\"/static/style.css\"></head><body class=\"{body_class}\">{nav}{content}<script src=\"/static/app.js\" defer></script></body></html>"""
+    page_content = nav if admin else nav + content
+    return f"""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"description\" content=\"个人博客、项目和浏览器游戏\"><title>{esc(title)} · Signal Desk</title><link rel=\"stylesheet\" href=\"/static/style.css\"></head><body class=\"{body_class}\">{page_content}<script src=\"/static/app.js\" defer></script></body></html>"""
 
 
 def status_badge(status: str) -> str:

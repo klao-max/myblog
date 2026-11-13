@@ -285,6 +285,11 @@ class SignalDeskTests(unittest.TestCase):
         self.conn.commit()
         self.assertNotIn("<script>", app.markdown("<script>alert(1)</script>"))
 
+    def test_admin_editor_form_is_rendered_once(self):
+        handler = SimpleNamespace(session=lambda: {"csrf": "test-csrf"})
+        html = app.edit_form(self.conn, handler, "posts")
+        self.assertEqual(html.count('class="editor-form"'), 1)
+
     def test_blog_listing_renders_timeline_in_newest_to_oldest_order(self):
         self.conn.executemany(
             "INSERT INTO posts(title, slug, excerpt, body, tags, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
