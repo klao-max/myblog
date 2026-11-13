@@ -31,6 +31,7 @@ SESSION_SECRET = os.getenv("SESSION_SECRET")
 
 MAX_BODY_BYTES = 256 * 1024
 MAX_MEDIA_BYTES = 8 * 1024 * 1024
+MAX_MULTIPART_BODY_BYTES = MAX_MEDIA_BYTES * 9 + 512 * 1024
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 10
 
@@ -603,8 +604,8 @@ def edit_form(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, kind: s
 
 
 def parse_multipart_form(body: bytes, content_type: str) -> tuple[dict[str, str], list[dict[str, object]]]:
-    if len(body) > MAX_BODY_BYTES:
-        raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
+    if len(body) > MAX_MULTIPART_BODY_BYTES:
+        raise RequestTooLarge(f"request body exceeds {MAX_MULTIPART_BODY_BYTES} bytes")
     message = BytesParser(policy=policy.default).parsebytes((f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode() + body)
     if not message.is_multipart():
         raise ValueError("请求格式无效")
@@ -769,14 +770,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             content_type = self.headers.get("Content-Type", "")
             if content_type.lower().startswith("multipart/form-data"):
-                length = int(self.headers.get("Content-Length", "0"))
-                if length > MAX_BODY_BYTES:
-                    raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except (TypeError, ValueError):
+                    raise ValueError("请求长度无效")
+                if length < 0:
+                    raise ValueError("请求长度无效")
+                if length > MAX_MULTIPART_BODY_BYTES:
+                    raise RequestTooLarge(f"request body exceeds {MAX_MULTIPART_BODY_BYTES} bytes")
                 form, files = parse_multipart_form(self.rfile.read(length), content_type)
             else:
                 form = self.parse_form()
         except RequestTooLarge:
             self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>请求内容过大</p></div></main>', 413)
+            return
+        except ValueError as exc:
+            self.send_html(f'<main class="subpage wrap"><div class="empty-state large"><p>{esc(exc)}</p></div></main>', 400)
             return
         conn = db()
         client_ip = self.client_address[0]

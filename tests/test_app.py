@@ -149,6 +149,15 @@ class SignalDeskTests(unittest.TestCase):
         stored = next(app.gallery_dir().glob("*"))
         self.assertTrue(stored.is_file())
 
+    def test_gallery_upload_accepts_multipart_body_over_form_limit(self):
+        token = "gallery-session-large"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body, content_type = self._multipart([("files", "large.jpg", "image/jpeg", b"x" * (app.MAX_BODY_BYTES + 1))])
+        handler = make_handler("/admin/media/upload", body, {"Content-Type": content_type, "Content-Length": str(len(body)), "Cookie": app.build_session_cookie(token)})
+        app.Handler.do_POST(handler)
+        self.assertIn("303 See Other", handler.wfile.getvalue().decode("latin-1"))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM site_images").fetchone()[0], 1)
+
     def test_gallery_upload_rejects_more_than_nine_files(self):
         token = "gallery-session-many"
         app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
