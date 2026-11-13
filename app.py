@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+from email import policy
+from email.parser import BytesParser
 import mimetypes
 import os
 import re
@@ -431,6 +433,7 @@ def render_page(title: str, content: str, *, admin: bool = False, active: str = 
         <a class=\"rail-link {"is-active" if active == "posts" else ""}\" href=\"/admin/posts\">文章 <span>⌘</span></a>
         <a class=\"rail-link {"is-active" if active == "projects" else ""}\" href=\"/admin/projects\">项目 <span>↗</span></a>
         <a class=\"rail-link {"is-active" if active == "games" else ""}\" href=\"/admin/games\">游戏 <span>▶</span></a>
+        <a class=\"rail-link {"is-active" if active == "media" else ""}\" href=\"/admin/media\">图库 <span>▧</span></a>
         <div class=\"rail-bottom\"><p class=\"rail-label\">状态</p><p class=\"rail-note\">本地 SQLite<br>Docker-ready</p></div></aside><main class=\"admin-main\">{content}</main></div>
         """
     else:
@@ -548,6 +551,19 @@ def admin_list(conn: sqlite3.Connection, kind: str) -> str:
     return render_page(f"管理{title}", content, admin=True, active=kind)
 
 
+def admin_media(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> str:
+    rows = conn.execute("SELECT * FROM site_images ORDER BY sort_order ASC, id ASC").fetchall()
+    settings = conn.execute("SELECT * FROM site_gallery_settings WHERE id=1").fetchone()
+    effect = settings["effect"] if settings else "fade"
+    cards = []
+    for row in rows:
+        controls = f'<form method="post" action="/admin/media/update">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="check-field"><input type="checkbox" name="enabled" {"checked" if row["enabled"] else ""} onchange="this.form.submit()"><span>启用</span></label><button name="direction" value="up" type="submit">↑</button><button name="direction" value="down" type="submit">↓</button></form>'
+        delete = f'<form method="post" action="/admin/media/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button type="submit">删除</button></form>'
+        cards.append(f'<article class="media-card"><img src="/media/gallery/{quote(row["stored_name"])}" alt="{esc(row["original_name"])}"><strong>{esc(row["original_name"])}</strong>{controls}{delete}</article>')
+    content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / MEDIA</p><h1>图库</h1><p>管理首页背景图片，最多保留 9 张。</p></div></div><form method="post" action="/admin/media/upload" enctype="multipart/form-data">{csrf_for(handler)}<input type="file" name="files" accept="image/jpeg,image/png,image/webp,image/gif" multiple required><button type="submit">上传图片</button></form><section class="media-grid">{"".join(cards) or "<p class=\"empty-state\">还没有图片。</p>"}</section><form method="post" action="/admin/media/settings">{csrf_for(handler)}{select_input("切换效果", "effect", effect, [("fade", "淡入淡出"), ("slide", "滑动"), ("zoom", "缩放")])}<button type="submit">保存效果</button></form>'
+    return render_page("图库", content, admin=True, active="media")
+
+
 def form_input(label: str, name: str, value: str = "", *, required: bool = False, placeholder: str = "", textarea: bool = False, rows: int = 8, input_type: str = "text") -> str:
     req = " required" if required else ""
     if textarea:
@@ -584,6 +600,25 @@ def edit_form(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, kind: s
         hint = "将游戏文件放到 games/<slug>/index.html 后，公开页会自动提供运行入口。"
     action = f"/admin/{kind}/save"
     return render_page(f"{'编辑' if not is_new else '新建'}{prefix}", f"""<div class=\"admin-heading compact\"><div><p class=\"kicker\">WORKSPACE / {kind.upper()}</p><h1>{'编辑' if not is_new else '新建'}{prefix}</h1><p>{hint}</p></div><a class=\"quiet-link\" href=\"/admin/{kind}\">← 返回列表</a></div><form class=\"editor-form\" method=\"post\" action=\"{action}\">{csrf_for(handler)}{f'<input type="hidden" name="id" value="{row["id"]}">' if not is_new else ''}<div class=\"form-main\">{fields}</div><aside class=\"form-aside\"><div class=\"save-card\"><p>发布动作</p><strong>{'更新已有内容' if not is_new else '保存为草稿'}</strong><button class=\"button button-primary button-wide\" type=\"submit\">保存{prefix} <span>↗</span></button><p class=\"form-help\">保存后可在公开站点检查结果。</p></div></aside></form>""", admin=True, active=kind)
+
+
+def parse_multipart_form(body: bytes, content_type: str) -> tuple[dict[str, str], list[dict[str, object]]]:
+    if len(body) > MAX_BODY_BYTES:
+        raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
+    message = BytesParser(policy=policy.default).parsebytes((f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode() + body)
+    if not message.is_multipart():
+        raise ValueError("请求格式无效")
+    fields: dict[str, str] = {}
+    files: list[dict[str, object]] = []
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if filename is not None:
+            files.append({"field": name or "", "filename": filename, "content_type": part.get_content_type(), "content": payload})
+        elif name:
+            fields[name] = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+    return fields, files
 
 
 def parse_form_data(data: str, length: int) -> dict[str, str]:
@@ -702,6 +737,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / SECURITY</p><h1>修改密码</h1><p>修改后，当前登录会话仍然有效。</p></div><a class="quiet-link" href="/admin">← 返回后台</a></div><form class="editor-form" method="post" action="/admin/password">{csrf_for(self)}<div class="form-main">{form_input("当前密码", "current_password", textarea=False, input_type="password")}{form_input("新密码", "new_password", textarea=False, input_type="password")}{form_input("确认新密码", "confirm_password", textarea=False, input_type="password")}</div><aside class="form-aside"><div class="save-card"><p>安全设置</p><strong>至少 12 个字符</strong><button class="button button-primary button-wide" type="submit">更新密码 ↗</button></div></aside></form>'''
                 self.send_html(render_page("修改密码", content, admin=True, active="overview")); return
+            if path == "/admin/media":
+                if not self.is_admin(): self.redirect("/admin/login"); return
+                self.send_html(admin_media(conn, self)); return
             if path == "/admin" or path == "/admin/":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_dashboard(conn)); return
@@ -727,8 +765,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = unquote(urlparse(self.path).path.rstrip("/")) or "/"
+        files: list[dict[str, object]] = []
         try:
-            form = self.parse_form()
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.lower().startswith("multipart/form-data"):
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > MAX_BODY_BYTES:
+                    raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
+                form, files = parse_multipart_form(self.rfile.read(length), content_type)
+            else:
+                form = self.parse_form()
         except RequestTooLarge:
             self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>请求内容过大</p></div></main>', 413)
             return
@@ -760,6 +806,39 @@ class Handler(BaseHTTPRequestHandler):
                 self.redirect("/admin/login"); return
             if form.get("csrf") != self.session().get("csrf"):
                 self.send_html(render_page("请求失效", '<main class="subpage wrap"><div class="empty-state large"><p>编辑会话已失效，请返回后台重试。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 403); return
+            if path == "/admin/media/upload":
+                count = conn.execute("SELECT COUNT(*) FROM site_images").fetchone()[0]
+                if count + len(files) > 9: raise ValueError("最多 9 张图片")
+                checked = []
+                for item in files:
+                    filename = str(item.get("filename") or "")
+                    payload = item.get("content") if isinstance(item.get("content"), bytes) else b""
+                    suffix, mime = validate_gallery_upload(filename, str(item.get("content_type") or ""), payload)
+                    checked.append((filename, payload, suffix, mime))
+                order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM site_images").fetchone()[0]
+                for filename, payload, suffix, mime in checked:
+                    stored = secrets.token_hex(16) + suffix; (gallery_dir() / stored).write_bytes(payload)
+                    conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)", (stored, filename, mime, len(payload), order, now_iso())); order += 1
+                conn.commit(); self.redirect("/admin/media"); return
+            if path == "/admin/media/update":
+                row_id = int(form.get("id", "0")); row = conn.execute("SELECT * FROM site_images WHERE id=?", (row_id,)).fetchone()
+                if not row: raise ValueError("图片不存在")
+                direction = form.get("direction")
+                if direction in {"up", "down"}:
+                    op, order = ("<", "DESC") if direction == "up" else (">", "ASC")
+                    other = conn.execute(f"SELECT id, sort_order FROM site_images WHERE sort_order {op} ? ORDER BY sort_order {order} LIMIT 1", (row["sort_order"],)).fetchone()
+                    if other: conn.execute("UPDATE site_images SET sort_order=? WHERE id=?", (other["sort_order"], row_id)); conn.execute("UPDATE site_images SET sort_order=? WHERE id=?", (row["sort_order"], other["id"]))
+                conn.execute("UPDATE site_images SET enabled=? WHERE id=?", (1 if form.get("enabled") == "on" else 0, row_id)); conn.commit(); self.redirect("/admin/media"); return
+            if path == "/admin/media/delete":
+                row_id = int(form.get("id", "0")); row = conn.execute("SELECT stored_name FROM site_images WHERE id=?", (row_id,)).fetchone()
+                if not row: raise ValueError("图片不存在")
+                conn.execute("DELETE FROM site_images WHERE id=?", (row_id,)); conn.commit(); target = gallery_dir() / row["stored_name"]
+                if target.exists(): target.unlink()
+                self.redirect("/admin/media"); return
+            if path == "/admin/media/settings":
+                effect = form.get("effect", "fade")
+                if effect not in {"fade", "slide", "zoom"}: raise ValueError("切换效果无效")
+                conn.execute("INSERT INTO site_gallery_settings(id,effect,interval,updated_at) VALUES (1,?,5,?) ON CONFLICT(id) DO UPDATE SET effect=excluded.effect,updated_at=excluded.updated_at", (effect, now_iso())); conn.commit(); self.redirect("/admin/media"); return
             if path == "/admin/password":
                 if form.get("new_password") != form.get("confirm_password"):
                     raise ValueError("两次输入的新密码不一致")

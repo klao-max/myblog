@@ -53,6 +53,8 @@ class SignalDeskTests(unittest.TestCase):
         conn.execute("DELETE FROM posts")
         conn.execute("DELETE FROM projects")
         conn.execute("DELETE FROM games")
+        conn.execute("DELETE FROM site_images")
+        conn.execute("DELETE FROM site_gallery_settings")
         conn.commit()
         self.conn = conn
 
@@ -124,6 +126,39 @@ class SignalDeskTests(unittest.TestCase):
         self.conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", ("off.jpg", "off.jpg", "image/jpeg", 1, 0, 0, now))
         self.conn.commit()
         self.assertEqual([row["stored_name"] for row in app.gallery_images(self.conn)], ["a.jpg", "b.jpg"])
+
+
+    def _multipart(self, files, csrf="integration-csrf"):
+        boundary = "----signal-test"
+        chunks = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n".encode()]
+        for name, filename, mime, payload in files:
+            chunks.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n").encode() + payload + b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode())
+        return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+    def test_gallery_upload_saves_file(self):
+        token = "gallery-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body, content_type = self._multipart([("files", "hero.jpg", "image/jpeg", b"\xff\xd8fake-jpeg")])
+        handler = make_handler("/admin/media/upload", body, {"Content-Type": content_type, "Content-Length": str(len(body)), "Cookie": app.build_session_cookie(token)})
+        app.Handler.do_POST(handler)
+        self.assertIn("303 See Other", handler.wfile.getvalue().decode("latin-1"))
+        self.assertIn("Location: /admin/media", handler.wfile.getvalue().decode("latin-1"))
+        row = self.conn.execute("SELECT original_name, mime_type FROM site_images").fetchone()
+        self.assertEqual((row["original_name"], row["mime_type"]), ("hero.jpg", "image/jpeg"))
+        stored = next(app.gallery_dir().glob("*"))
+        self.assertTrue(stored.is_file())
+
+    def test_gallery_upload_rejects_more_than_nine_files(self):
+        token = "gallery-session-many"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body, content_type = self._multipart([("files", f"{i}.jpg", "image/jpeg", b"x") for i in range(10)])
+        handler = make_handler("/admin/media/upload", body, {"Content-Type": content_type, "Content-Length": str(len(body)), "Cookie": app.build_session_cookie(token)})
+        app.Handler.do_POST(handler)
+        response = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("400 Bad Request", response)
+        self.assertIn("最多 9 张", response)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM site_images").fetchone()[0], 0)
 
     def test_new_published_post_saves_with_cover_field(self):
         token = "integration-session"
