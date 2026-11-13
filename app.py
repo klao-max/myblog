@@ -28,8 +28,16 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 SESSION_SECRET = os.getenv("SESSION_SECRET")
 
 MAX_BODY_BYTES = 256 * 1024
+MAX_MEDIA_BYTES = 8 * 1024 * 1024
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 10
+
+ALLOWED_MEDIA_TYPES = {
+    "image/jpeg": {".jpg", ".jpeg"},
+    "image/png": {".png"},
+    "image/webp": {".webp"},
+    "image/gif": {".gif"},
+}
 
 SESSIONS: dict[str, dict[str, str]] = {}
 LOGIN_FAILURES: dict[str, list[float]] = {}
@@ -146,11 +154,51 @@ CREATE TABLE IF NOT EXISTS games (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS site_images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stored_name TEXT UNIQUE NOT NULL,
+  original_name TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS site_gallery_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  effect TEXT NOT NULL DEFAULT 'fade',
+  interval INTEGER NOT NULL DEFAULT 5,
+  updated_at TEXT NOT NULL
+);
 """
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def gallery_dir() -> Path:
+    path = DATA_DIR / "uploads" / "gallery"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def validate_gallery_upload(filename: str, content_type: str, payload: bytes) -> tuple[str, str]:
+    if len(payload) > MAX_MEDIA_BYTES:
+        raise ValueError("图片不能超过 8 MB")
+    suffix = Path(filename).suffix.lower()
+    mime_type = content_type.split(";", 1)[0].strip().lower()
+    if mime_type not in ALLOWED_MEDIA_TYPES:
+        raise ValueError("不支持的图片类型")
+    if suffix not in ALLOWED_MEDIA_TYPES[mime_type]:
+        raise ValueError("文件扩展名与图片类型不匹配")
+    return suffix, mime_type
+
+
+def gallery_images(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM site_images WHERE enabled = 1 ORDER BY sort_order ASC, id ASC"
+    ).fetchall()
 
 
 def db() -> sqlite3.Connection:
@@ -610,6 +658,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.startswith("/static/"):
                 self.serve_file(ROOT / path.lstrip("/"), ROOT / "static")
+                return
+            if path.startswith("/media/gallery/"):
+                stored_name = path[len("/media/gallery/"):]
+                if not stored_name:
+                    self.send_error(404)
+                    return
+                self.serve_file(gallery_dir() / stored_name, gallery_dir())
                 return
             if path.startswith("/games/") and path.endswith("/play"):
                 slug = path.split("/")[2]

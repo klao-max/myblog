@@ -111,6 +111,20 @@ class SignalDeskTests(unittest.TestCase):
         with self.assertRaises(app.RequestTooLarge):
             app.parse_form_data("x" * (app.MAX_BODY_BYTES + 1), app.MAX_BODY_BYTES + 1)
 
+    def test_gallery_rejects_unsupported_type_and_oversized_file(self):
+        with self.assertRaises(ValueError):
+            app.validate_gallery_upload("script.svg", "image/svg+xml", b"svg")
+        with self.assertRaises(ValueError):
+            app.validate_gallery_upload("large.jpg", "image/jpeg", b"x" * (app.MAX_MEDIA_BYTES + 1))
+
+    def test_gallery_images_are_ordered_and_filter_disabled_rows(self):
+        now = app.now_iso()
+        self.conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", ("b.jpg", "b.jpg", "image/jpeg", 1, 2, 1, now))
+        self.conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", ("a.jpg", "a.jpg", "image/jpeg", 1, 1, 1, now))
+        self.conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", ("off.jpg", "off.jpg", "image/jpeg", 1, 0, 0, now))
+        self.conn.commit()
+        self.assertEqual([row["stored_name"] for row in app.gallery_images(self.conn)], ["a.jpg", "b.jpg"])
+
     def test_new_published_post_saves_with_cover_field(self):
         token = "integration-session"
         app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
