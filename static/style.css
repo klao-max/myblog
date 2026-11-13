@@ -673,15 +673,24 @@ h1, h2, h3 { letter-spacing: -.055em; }
   background-clip: content-box;
 }
 
-.timeline-entry .timeline-date {
+.timeline-date {
+  position: absolute;
+  bottom: 29px;
+  left: 50%;
+  z-index: 3;
   display: inline-flex;
   min-height: 28px;
   align-items: center;
-  margin-bottom: 24px;
+  margin: 0;
   padding: 4px 8px;
   border: 1px solid var(--orange-deep);
-  background: rgba(255, 138, 61, .12);
+  background: var(--paper);
+  box-shadow: 0 0 0 4px var(--paper);
   color: var(--orange-deep);
   font-size: 12px;
   letter-spacing: .1em;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
 }

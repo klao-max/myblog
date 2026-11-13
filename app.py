@@ -460,7 +460,7 @@ def article_timeline(rows: list[sqlite3.Row]) -> str:
     if not rows:
         return ""
     items = "".join(
-        f"""<li class=\"timeline-item\"><a class=\"timeline-entry\" href=\"/blog/{quote(row['slug'])}\"><time class=\"timeline-date\" datetime=\"{esc(row['published_at'] or '')}\">{esc(fmt_date(row['published_at']))}</time><strong>{esc(row['title'])}</strong><span>{esc(row['excerpt'])}</span></a></li>"""
+        f"""<li class=\"timeline-item\"><a class=\"timeline-entry\" href=\"/blog/{quote(row['slug'])}\"><strong>{esc(row['title'])}</strong><span>{esc(row['excerpt'])}</span></a><time class=\"timeline-date\" datetime=\"{esc(row['published_at'] or '')}\">{esc(fmt_date(row['published_at']))}</time></li>"""
         for row in rows
     )
     return f"""<section class=\"article-timeline-section\" aria-labelledby=\"timeline-title\"><div class=\"timeline-heading\"><div><p class=\"kicker\">ARCHIVE / TIMELINE</p><h2 id=\"timeline-title\">沿着时间线回看。</h2></div><span class=\"timeline-direction\">最新 <span aria-hidden=\"true\">←</span> 早期</span></div><nav class=\"article-timeline\" aria-label=\"文章时间线\"><div class=\"timeline-scroll\"><ol class=\"timeline-track\">{items}</ol></div></nav></section>"""
