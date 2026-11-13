@@ -305,6 +305,7 @@ class SignalDeskTests(unittest.TestCase):
 
         self.assertIn('class="article-timeline"', html)
         self.assertIn("2026.02.14", timeline_html)
+        self.assertIn('class="timeline-date"', timeline_html)
         self.assertIn("The latest excerpt", timeline_html)
         self.assertLess(timeline_html.index("Newest note"), timeline_html.index("Older note"))
 

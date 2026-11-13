@@ -648,3 +648,40 @@ h1, h2, h3 { letter-spacing: -.055em; }
     aspect-ratio: 16 / 9;
   }
 }
+
+/* Timeline visibility and drag scrolling. */
+.timeline-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-color: var(--orange) rgba(17, 22, 29, .14);
+  scrollbar-width: auto;
+}
+
+.timeline-scroll::-webkit-scrollbar {
+  height: 12px;
+}
+
+.timeline-scroll::-webkit-scrollbar-track {
+  background: rgba(17, 22, 29, .12);
+}
+
+.timeline-scroll::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--orange);
+  background-clip: content-box;
+}
+
+.timeline-entry .timeline-date {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  margin-bottom: 24px;
+  padding: 4px 8px;
+  border: 1px solid var(--orange-deep);
+  background: rgba(255, 138, 61, .12);
+  color: var(--orange-deep);
+  font-size: 12px;
+  letter-spacing: .1em;
+}
