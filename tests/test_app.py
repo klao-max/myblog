@@ -127,6 +127,21 @@ class SignalDeskTests(unittest.TestCase):
         self.conn.commit()
         self.assertEqual([row["stored_name"] for row in app.gallery_images(self.conn)], ["a.jpg", "b.jpg"])
 
+    def test_blog_gallery_includes_carousel_contract(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("contract.jpg", "contract.jpg", "image/jpeg", 1, 1, 1, now),
+        )
+        self.conn.commit()
+
+        rendered = app.blog_gallery(self.conn)
+
+        self.assertRegex(rendered, r'data-effect="(?:fade|slide|zoom)"')
+        self.assertIn('data-interval="5"', rendered)
+        self.assertIn('class="blog-gallery__slide is-active"', rendered)
+        self.assertIn('aria-label="暂停背景轮播"', rendered)
+
     def test_blog_gallery_falls_back_without_images(self):
         self.assertEqual(app.blog_gallery(self.conn), "")
 
