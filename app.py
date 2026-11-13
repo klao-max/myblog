@@ -479,10 +479,14 @@ def blog_gallery(conn: sqlite3.Connection) -> str:
     if interval <= 0:
         interval = 5
 
-    slides = "".join(
-        f'<figure class="blog-gallery__slide{" is-active" if index == 0 else ""}"><img src="/media/gallery/{quote(str(row["stored_name"]), safe="")}" alt="{esc(row["original_name"])}"></figure>'
-        for index, row in enumerate(images)
-    )
+    slide_items = []
+    for index, row in enumerate(images):
+        active = " is-active" if index == 0 else ""
+        hidden = "" if index == 0 else ' aria-hidden="true"'
+        slide_items.append(
+            f'<figure class="blog-gallery__slide{active}"{hidden}><img src="/media/gallery/{quote(str(row["stored_name"]), safe="")}" alt="{esc(row["original_name"])}"></figure>'
+        )
+    slides = "".join(slide_items)
     return f"""<section class="blog-gallery" data-effect="{esc(effect)}" data-interval="{interval}">
     <div class="blog-gallery__slides" aria-label="博客背景图片">{slides}</div>
     <div class="blog-gallery__scrim" aria-hidden="true"></div>
@@ -585,10 +589,10 @@ def admin_media(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> st
     settings = conn.execute("SELECT * FROM site_gallery_settings WHERE id=1").fetchone()
     effect = settings["effect"] if settings else "fade"
     cards = []
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         controls = f'<form method="post" action="/admin/media/update">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="check-field"><input type="checkbox" name="enabled" {"checked" if row["enabled"] else ""} onchange="this.form.submit()"><span>启用</span></label><button name="direction" value="up" type="submit">↑</button><button name="direction" value="down" type="submit">↓</button></form>'
         delete = f'<form method="post" action="/admin/media/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button type="submit">删除</button></form>'
-        cards.append(f'<article class="media-card"><img src="/media/gallery/{quote(row["stored_name"])}" alt="{esc(row["original_name"])}"><strong>{esc(row["original_name"])}</strong>{controls}{delete}</article>')
+        cards.append(f'<article class="media-card"><span class="media-card__order" aria-label="顺序 {index}">{index}</span><img src="/media/gallery/{quote(row["stored_name"])}" alt="{esc(row["original_name"])}"><strong>{esc(row["original_name"])}</strong>{controls}{delete}</article>')
     content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / MEDIA</p><h1>图库</h1><p>管理首页背景图片，最多保留 9 张。</p></div></div><form method="post" action="/admin/media/upload" enctype="multipart/form-data">{csrf_for(handler)}<input type="file" name="files" accept="image/jpeg,image/png,image/webp,image/gif" multiple required><button type="submit">上传图片</button></form><section class="media-grid">{"".join(cards) or "<p class=\"empty-state\">还没有图片。</p>"}</section><form method="post" action="/admin/media/settings">{csrf_for(handler)}{select_input("切换效果", "effect", effect, [("fade", "淡入淡出"), ("slide", "滑动"), ("zoom", "缩放")])}<button type="submit">保存效果</button></form>'
     return render_page("图库", content, admin=True, active="media")
 

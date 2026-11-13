@@ -169,6 +169,7 @@ class SignalDeskTests(unittest.TestCase):
         self.assertIn('/media/gallery/second%20image.jpg', rendered)
         self.assertLess(rendered.index("first%20image.jpg"), rendered.index("second%20image.jpg"))
         self.assertIn('class="blog-gallery__slide is-active"', rendered)
+        self.assertIn('class="blog-gallery__slide" aria-hidden="true"', rendered)
         self.assertIn("second &lt;image&gt;.jpg", rendered)
 
 

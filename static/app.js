@@ -32,9 +32,13 @@ document.addEventListener('DOMContentLoaded', () => {
     let manuallyPaused = false;
     let hoverPaused = false;
     let focusPaused = false;
+    let direction = 1;
     if (current < 0) current = 0;
 
     gallery.dataset.effect = effect;
+    slides.forEach((slide, index) => {
+      slide.setAttribute('aria-hidden', index === current ? 'false' : 'true');
+    });
 
     const setPausedLabel = () => {
       if (!pauseButton) return;
@@ -55,7 +59,11 @@ document.addEventListener('DOMContentLoaded', () => {
       timer = window.setInterval(() => {
         const next = (current + 1) % slides.length;
         slides[current].classList.remove('is-active');
+        slides[current].setAttribute('aria-hidden', 'true');
+        direction *= -1;
+        slides[next].style.setProperty('--gallery-enter', `${direction * 100}%`);
         slides[next].classList.add('is-active');
+        slides[next].setAttribute('aria-hidden', 'false');
         current = next;
       }, interval);
     };
