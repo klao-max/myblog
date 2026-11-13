@@ -664,7 +664,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             form = self.parse_form()
         except RequestTooLarge:
-            self.send_error(413, "请求内容过大")
+            self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>请求内容过大</p></div></main>', 413)
             return
         conn = db()
         client_ip = self.client_address[0]
@@ -722,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                         conn.execute("UPDATE posts SET title=?, slug=?, excerpt=?, body=?, tags=?, cover=?, status=?, published_at=?, updated_at=? WHERE id=?", tuple(data.get(c, "") for c in columns) + (published_at, timestamp, form["id"]))
                     else:
                         published_at = timestamp if status == "published" else None
-                        conn.execute("INSERT INTO posts(title, slug, excerpt, body, tags, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(data.get(c, "") for c in columns) + (published_at, timestamp, timestamp))
+                        conn.execute("INSERT INTO posts(title, slug, excerpt, body, tags, cover, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(data.get(c, "") for c in columns) + (published_at, timestamp, timestamp))
                 elif kind == "projects":
                     status = data.get("status", "active")
                     if status not in {"active", "paused", "archived"}:

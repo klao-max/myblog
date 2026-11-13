@@ -4,6 +4,8 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlencode
 
 os.environ.setdefault("APP_ENV", "development")
 os.environ.setdefault("ADMIN_PASSWORD", "test-password")
@@ -12,6 +14,26 @@ os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="signal-desk-tests-")
 os.environ["DATABASE_PATH"] = str(Path(os.environ["DATA_DIR"]) / "blog.db")
 
 import app
+
+
+class RequestHeaders(dict):
+    def get_all(self, key, default=None):
+        value = self.get(key, default)
+        return [value] if value is not None else default
+
+
+def make_handler(path: str, body: bytes, headers: dict[str, str] | None = None):
+    handler = app.Handler.__new__(app.Handler)
+    handler.path = path
+    handler.requestline = f"POST {path} HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.command = "POST"
+    handler.client_address = ("127.0.0.1", 12345)
+    handler.server = SimpleNamespace(server_name="localhost", server_port=8000)
+    handler.headers = RequestHeaders(headers or {})
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = io.BytesIO()
+    return handler
 
 
 class SignalDeskTests(unittest.TestCase):
@@ -88,6 +110,62 @@ class SignalDeskTests(unittest.TestCase):
     def test_oversized_form_is_rejected(self):
         with self.assertRaises(app.RequestTooLarge):
             app.parse_form_data("x" * (app.MAX_BODY_BYTES + 1), app.MAX_BODY_BYTES + 1)
+
+    def test_new_published_post_saves_with_cover_field(self):
+        token = "integration-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body = urlencode(
+            {
+                "csrf": "integration-csrf",
+                "title": "A new post",
+                "slug": "a-new-post",
+                "excerpt": "An excerpt",
+                "body": "Post body",
+                "tags": "testing",
+                "cover": "https://example.com/cover.png",
+                "status": "published",
+            }
+        ).encode()
+
+        handler = make_handler(
+            "/admin/posts/save",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+        app.Handler.do_POST(handler)
+
+        row = self.conn.execute("SELECT cover, status FROM posts WHERE slug = ?", ("a-new-post",)).fetchone()
+        self.assertEqual(dict(row), {"cover": "https://example.com/cover.png", "status": "published"})
+        response_text = handler.wfile.getvalue().decode("latin-1")
+        self.assertIn("303 See Other", response_text)
+        self.assertIn("Location: /admin/posts", response_text)
+
+    def test_oversized_request_returns_parseable_413_and_server_remains_available(self):
+        body = b"x" * (app.MAX_BODY_BYTES + 1)
+        handler = make_handler(
+            "/admin/login",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+            },
+        )
+        app.Handler.do_POST(handler)
+        response_text = handler.wfile.getvalue().decode("utf-8")
+
+        follow_up = make_handler("/admin/login", b"")
+        follow_up.command = "GET"
+        follow_up.requestline = "GET /admin/login HTTP/1.1"
+        app.Handler.do_GET(follow_up)
+        follow_up_text = follow_up.wfile.getvalue().decode("utf-8")
+
+        self.assertIn("413 Request Entity Too Large", response_text)
+        self.assertIn("请求内容过大", response_text)
+        self.assertIn("200 OK", follow_up_text)
 
     def test_login_failures_are_rate_limited(self):
         for now in range(app.LOGIN_MAX_ATTEMPTS):
