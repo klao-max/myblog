@@ -1,0 +1,4 @@
+blog.kangmouren.online {
+    encode zstd gzip
+    reverse_proxy myblog:8000
+}

@@ -20,6 +20,46 @@ python app.py
 
 用户名默认为 `admin`，密码和 session secret 取环境变量 `ADMIN_PASSWORD`、`SESSION_SECRET`。生产环境未设置这两个变量时会拒绝启动。
 
+## 腾讯云生产部署（Caddy + HTTPS）
+
+Compose 已包含博客应用和 Caddy 反向代理，生产域名固定为：
+
+<https://blog.kangmouren.online>
+
+先在腾讯云 DNS 中添加一条记录：
+
+```text
+类型：A
+主机记录：blog
+记录值：你的腾讯云服务器公网 IPv4
+```
+
+服务器安全组放行 `80/TCP`、`443/TCP`；如果要启用 Caddy 的 HTTP/3，再放行 `443/UDP`，并限制 `22` 只允许你的管理 IP。将项目上传到服务器后，在项目目录执行：
+
+```bash
+printf 'APP_ENV=production\nADMIN_USERNAME=admin\nADMIN_PASSWORD=%s\nSESSION_SECRET=%s\n' \\
+  "$(openssl rand -hex 24)" \\
+  "$(openssl rand -hex 32)" > .env
+chmod 600 .env
+
+docker compose up -d --build
+docker compose ps
+docker compose logs -f caddy
+```
+
+Caddy 会在 DNS 生效且 80/443 可访问后自动申请和续期 HTTPS 证书。部署完成后访问 <https://blog.kangmouren.online>，后台地址为 <https://blog.kangmouren.online/admin/login>。
+
+应用容器只绑定本机 `127.0.0.1:8001`，公网流量统一经过 Caddy。Caddy 的证书和配置保存在 `caddy_data`、`caddy_config` 两个 volume 中。
+
+停止或重启服务：
+
+```bash
+docker compose down
+docker compose up -d
+```
+
+不要使用 `docker compose down -v`，否则会删除数据库、上传文件和 Caddy 证书。
+
 ## 使用 Docker Desktop
 
 确保 Docker Desktop 已启动，并先设置 `ADMIN_PASSWORD`、`SESSION_SECRET`，然后在 PowerShell 执行：
@@ -29,7 +69,7 @@ cd D:\Users\MyProject\myblog
 docker compose -f compose.yaml up --build -d
 ```
 
-打开 <http://127.0.0.1:8001>。
+本地直接检查应用可打开 <http://127.0.0.1:8001>；生产后台登录请使用上面的 HTTPS 域名。
 
 查看日志：
 
@@ -64,7 +104,6 @@ SQLite 和上传文件都存在 Docker volume `myblog_data` 中，重启容器�
 
 留言只保存纯文本，单条最多 2000 字；公开页面不会显示 IP。系统按 IP 做短时间提交频率限制，并使用隐藏字段拦截常见机器人提交。
 
-
 ## 添加游戏
 
 将每个游戏放到：
@@ -88,6 +127,7 @@ games/<slug>/index.html
 
 ## 生产环境前需要替换
 
-- 将 `ADMIN_PASSWORD`、`SESSION_SECRET` 放到本机 `.env` 或部署平台的 secret 中
-- 为公网环境增加 HTTPS、反向代理和备份策略
+- 将 `ADMIN_PASSWORD`、`SESSION_SECRET` 放到服务器本机 `.env` 或部署平台的 secret 中
+- 配置 `blog.kangmouren.online` 的 DNS A 记录
+- 按运维流程备份 `myblog_data`、`caddy_data` 和 `caddy_config`
 

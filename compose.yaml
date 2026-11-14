@@ -3,7 +3,7 @@ services:
     build: .
     container_name: myblog
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       APP_ENV: production
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
@@ -19,8 +19,33 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    networks:
+      - myblog_net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: myblog_caddy
+    depends_on:
+      myblog:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks:
+      - myblog_net
 
 volumes:
   myblog_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  myblog_net:
 
 

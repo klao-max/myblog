@@ -310,6 +310,7 @@ class SignalDeskTests(unittest.TestCase):
         self.assertIn('</a><time class="timeline-date"', timeline_html)
         self.assertIn("The latest excerpt", timeline_html)
         self.assertLess(timeline_html.index("Newest note"), timeline_html.index("Older note"))
+
     def test_public_comment_is_saved_with_ip_and_visible(self):
         now = app.now_iso()
         self.conn.execute(
@@ -380,7 +381,6 @@ class SignalDeskTests(unittest.TestCase):
 
         row = self.conn.execute("SELECT content, reply, visible FROM comments WHERE id=?", (comment_id,)).fetchone()
         self.assertEqual((row["content"], row["reply"], row["visible"]), ("Edited", "已处理", 0))
-
 
 
 if __name__ == "__main__":

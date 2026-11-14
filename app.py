@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+import mimetypes
 from email import policy
 from email.parser import BytesParser
-import mimetypes
 import os
 import re
 import secrets
@@ -216,6 +216,22 @@ def gallery_images(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM site_images WHERE enabled = 1 ORDER BY sort_order ASC, id ASC"
     ).fetchall()
+
+
+def comment_attempts(ip: str, now: float | None = None) -> list[float]:
+    now = now if now is not None else time.time()
+    attempts = [stamp for stamp in COMMENT_SUBMISSIONS.get(ip, []) if now - stamp < COMMENT_WINDOW_SECONDS]
+    COMMENT_SUBMISSIONS[ip] = attempts
+    return attempts
+
+
+def comment_rate_limited(ip: str, now: float | None = None) -> bool:
+    return len(comment_attempts(ip, now)) >= COMMENT_MAX_SUBMISSIONS
+
+
+def record_comment_submission(ip: str, now: float | None = None) -> None:
+    now = now if now is not None else time.time()
+    comment_attempts(ip, now).append(now)
 
 
 def db() -> sqlite3.Connection:
@@ -468,7 +484,8 @@ def status_badge(status: str) -> str:
 
 
 def public_card(kind: str, title: str, summary: str, href: str, meta: str, extra: str = "") -> str:
-    return f"""<article class=\"content-card\"><div class=\"card-top\"><span class=\"card-kind\">{esc(kind)}</span><span class=\"card-meta\">{esc(meta)}</span></div><h3><a href=\"{href}\">{esc(title)}</a></h3><p>{esc(summary)}</p>{extra}<a class=\"text-link\" href=\"{href}\">打开内容 <span>↗</span></a></article>"""
+    material = "glass-card" if kind in {"项目", "游戏"} else "paper-card"
+    return f"""<article class=\"content-card {material}\"><div class=\"card-top\"><span class=\"card-kind\">{esc(kind)}</span><span class=\"card-meta\">{esc(meta)}</span></div><h3><a href=\"{href}\">{esc(title)}</a></h3><p>{esc(summary)}</p>{extra}<a class=\"text-link\" href=\"{href}\">打开内容 <span>↗</span></a></article>"""
 
 
 def article_timeline(rows: list[sqlite3.Row]) -> str:
@@ -519,10 +536,10 @@ def home(conn: sqlite3.Connection) -> str:
     project_html = "".join(public_card("项目", r["name"], r["summary"], f"/projects/{quote(r['slug'])}", r["status"], f'<div class="tag-line">{" · ".join(esc(t) for t in tags(r["tech_stack"]))}</div>') for r in projects)
     game_html = "".join(public_card("游戏", r["name"], r["summary"], f"/games/{quote(r['slug'])}", "可玩", '<span class="play-mark">▶ 立即开始</span>') for r in games)
     return render_page("首页", f"""
-    <main><section class=\"hero wrap\"><div class=\"hero-copy\"><p class=\"kicker\">PERSONAL WORKSHOP · 2026</p><h1>写下来，<br><em>做出来。</em></h1><p class=\"hero-lead\">这里收集文章、项目和一些可以直接打开的小游戏。一个人的工作台，也可以是一张公开的地图。</p><div class=\"hero-actions\"><a class=\"button button-primary\" href=\"/blog\">阅读文章 <span>↗</span></a><a class=\"button button-secondary\" href=\"/projects\">查看项目</a></div></div><div class=\"hero-note\"><span class=\"note-line\"></span><p>当前状态</p><strong>持续更新中</strong><small>文章 / 项目 / 游戏</small></div></section>
-    <section class=\"lane-section wrap\"><div class=\"section-head\"><div><p class=\"section-index\">01 — 文章</p><h2>把想法写成可回看的东西。</h2></div><a class=\"text-link\" href=\"/blog\">全部文章 ↗</a></div><div class=\"card-grid\">{post_html or '<p class="empty-state">还没有发布文章。</p>'}</div></section>
-    <section class=\"lane-section wrap section-dark\"><div class=\"section-head\"><div><p class=\"section-index\">02 — 项目</p><h2>正在做的，和已经做完的。</h2></div><a class=\"text-link\" href=\"/projects\">全部项目 ↗</a></div><div class=\"card-grid\">{project_html or '<p class="empty-state">还没有项目。</p>'}</div></section>
-    <section class=\"lane-section wrap\"><div class=\"section-head\"><div><p class=\"section-index\">03 — 游戏</p><h2>小东西也应该有自己的入口。</h2></div><a class=\"text-link\" href=\"/games\">全部游戏 ↗</a></div><div class=\"card-grid\">{game_html or '<p class="empty-state">还没有游戏。</p>'}</div></section>
+    <main><section class=\"hero wrap\"><div class=\"hero-copy\"><p class=\"kicker\">PERSONAL WORKSHOP · 2026</p><h1>写下来，<br><em>做出来。</em></h1><p class=\"hero-lead\">这里收集文章、项目和一些可以直接打开的小游戏。一个人的工作台，也可以是一张公开的地图。</p><div class=\"hero-actions\"><a class=\"button button-primary\" href=\"/blog\">阅读文章 <span>↗</span></a><a class=\"button button-secondary\" href=\"/projects\">查看项目</a></div></div><div class=\"hero-note glass-surface\"><span class=\"note-line\"></span><p>当前状态</p><strong>持续更新中</strong><small>文章 / 项目 / 游戏</small></div></section>
+    <section class=\"lane-section wrap lane-posts\"><div class=\"section-head\"><div><p class=\"section-index\">01 — 文章</p><h2>把想法写成可回看的东西。</h2></div><a class=\"text-link\" href=\"/blog\">全部文章 ↗</a></div><div class=\"card-grid\">{post_html or '<p class="empty-state">还没有发布文章。</p>'}</div></section>
+    <section class=\"lane-section wrap section-dark lane-projects\"><div class=\"section-head\"><div><p class=\"section-index\">02 — 项目</p><h2>正在做的，和已经做完的。</h2></div><a class=\"text-link\" href=\"/projects\">全部项目 ↗</a></div><div class=\"card-grid\">{project_html or '<p class="empty-state">还没有项目。</p>'}</div></section>
+    <section class=\"lane-section wrap lane-games\"><div class=\"section-head\"><div><p class=\"section-index\">03 — 游戏</p><h2>小东西也应该有自己的入口。</h2></div><a class=\"text-link\" href=\"/games\">全部游戏 ↗</a></div><div class=\"card-grid\">{game_html or '<p class="empty-state">还没有游戏。</p>'}</div></section>
     <footer class=\"site-footer wrap\"><span>Signal Desk / 个人工作台</span><span>Built slowly, shipped often.</span></footer></main>""", active="")
 
 
