@@ -402,6 +402,25 @@ class SignalDeskTests(unittest.TestCase):
         self.assertIn('/admin/comments/edit?id=', html)
         self.assertEqual(html.count('action="/admin/comments/delete"'), 1)
 
+    def test_comment_time_shows_minutes_on_public_and_admin_views(self):
+        self.conn.execute(
+            "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Timed post", "timed-post", "Excerpt", "Body", "published", "2026-11-15T12:34:56+00:00", "2026-11-15T12:34:56+00:00", "2026-11-15T12:34:56+00:00"),
+        )
+        post_id = self.conn.execute("SELECT id FROM posts WHERE slug='timed-post'").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO comments(post_id, content, ip_address, reply, visible, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (post_id, "Minute detail", "203.0.113.9", "", 1, "2026-11-15T12:34:56+00:00", "2026-11-15T12:34:56+00:00"),
+        )
+        self.conn.commit()
+
+        status, public_html = app.detail(self.conn, "blog", "timed-post")
+        admin_html = app.admin_comments(self.conn, SimpleNamespace(session=lambda: {"csrf": "test-csrf"}))
+
+        self.assertEqual(status, 200)
+        self.assertIn("2026.11.15 12:34", public_html)
+        self.assertIn("2026.11.15 12:34", admin_html)
+
 
 if __name__ == "__main__":
     unittest.main()

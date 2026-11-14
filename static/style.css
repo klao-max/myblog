@@ -1109,7 +1109,7 @@ h1, h2, h3 { letter-spacing: -.055em; }
 .admin-comments-table-head,
 .admin-comment-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 180px 150px;
+  grid-template-columns: minmax(0, 1fr) 190px 168px;
   align-items: center;
   gap: 22px;
 }
@@ -1147,7 +1147,7 @@ h1, h2, h3 { letter-spacing: -.055em; }
 .admin-comment-row-status.is-visible { border-color: rgba(99, 217, 199, .48); color: var(--cyan); }
 .admin-comment-row-meta { display: grid; gap: 6px; color: var(--desk-muted); font-size: 12px; }
 .admin-comment-row-meta time { color: #718196; }
-.admin-comment-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.admin-comment-row-actions { display: flex; align-items: center; justify-content: flex-end; justify-self: end; gap: 8px; width: 168px; }
 .admin-comment-row-actions form { margin: 0; }
 .admin-comment-row-actions .button { min-height: 34px; padding: 0 12px; font-size: 12px; }
 .admin-comment-edit-form { width: min(100%, 760px); display: grid; gap: 18px; }

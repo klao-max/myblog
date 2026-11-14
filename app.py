@@ -381,6 +381,15 @@ def fmt_date(value: str | None) -> str:
         return value[:10]
 
 
+def fmt_datetime(value: str | None) -> str:
+    if not value:
+        return "未记录"
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y.%m.%d %H:%M")
+    except ValueError:
+        return value[:16].replace("T", " ")
+
+
 def tags(value: str | None) -> list[str]:
     return [x.strip() for x in (value or "").replace("，", ",").split(",") if x.strip()]
 
@@ -635,7 +644,7 @@ def comment_section(conn: sqlite3.Connection, post_id: int, slug: str) -> str:
     cards = []
     for row in rows:
         reply = f'<div class="comment-reply"><strong>站长回复</strong><p>{esc(row["reply"])}</p></div>' if row["reply"] else ""
-        cards.append(f'<article class="comment-card"><time>{esc(fmt_date(row["created_at"]))}</time><p>{esc(row["content"])}</p>{reply}</article>')
+        cards.append(f'<article class="comment-card"><time>{esc(fmt_datetime(row["created_at"]))}</time><p>{esc(row["content"])}</p>{reply}</article>')
     return f'''<section class="comments-section" aria-labelledby="comments-title"><div class="comments-head"><div><p class="kicker">OPEN NOTES</p><h2 id="comments-title">留下你的建议</h2></div><span>{len(rows)} 条留言</span></div><form class="comment-form" method="post" action="/blog/{quote(slug)}/comments"><label class="field"><span>留言内容</span><textarea name="content" rows="5" maxlength="{MAX_COMMENT_CHARS}" required placeholder="写下你的想法、问题或建议"></textarea></label><label class="comment-honeypot" aria-hidden="true">网站<input name="website" tabindex="-1" autocomplete="off"></label><button class="button button-primary" type="submit">发布留言 <span>↗</span></button></form><div class="comment-list">{"".join(cards) or '<p class="empty-state">还没有留言，欢迎留下第一条建议。</p>'}</div></section>'''
 
 
@@ -646,7 +655,7 @@ def admin_comments(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) ->
         delete_form = f'''<form method="post" action="/admin/comments/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button class="button button-ghost" type="submit">删除</button></form>'''
         reply = f'<span class="admin-comment-row-reply">已回复：{esc(row["reply"])}</span>' if row["reply"] else '<span class="admin-comment-row-reply is-empty">待回复</span>'
         visibility = '<span class="admin-comment-row-status is-visible">公开</span>' if row["visible"] else '<span class="admin-comment-row-status">已隐藏</span>'
-        cards.append(f'''<article class="admin-comment-row"><div class="admin-comment-row-main"><div class="admin-comment-row-title"><strong>{esc(row["post_title"])}</strong>{visibility}</div><p>{esc(row["content"])}</p><div class="admin-comment-row-submeta">{reply}</div></div><div class="admin-comment-row-meta"><span>{esc(row["ip_address"])}</span><time>{esc(fmt_date(row["created_at"]))}</time></div><div class="admin-comment-row-actions"><a class="button button-primary" href="/admin/comments/edit?id={row["id"]}">编辑 ↗</a>{delete_form}</div></article>''')
+        cards.append(f'''<article class="admin-comment-row"><div class="admin-comment-row-main"><div class="admin-comment-row-title"><strong>{esc(row["post_title"])}</strong>{visibility}</div><p>{esc(row["content"])}</p><div class="admin-comment-row-submeta">{reply}</div></div><div class="admin-comment-row-meta"><span>{esc(row["ip_address"])}</span><time>{esc(fmt_datetime(row["created_at"]))}</time></div><div class="admin-comment-row-actions"><a class="button button-primary" href="/admin/comments/edit?id={row["id"]}">编辑 ↗</a>{delete_form}</div></article>''')
     content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>按时间查看留言，编辑和删除操作位于每行末尾。</p></div></div><section class="admin-comments-list"><div class="admin-comments-table-head"><span>留言</span><span>来源</span><span>操作</span></div>{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>'
     return render_page("留言管理", content, admin=True, active="comments")
 
@@ -655,7 +664,7 @@ def admin_comment_edit(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler
     row = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id WHERE comments.id = ?", (comment_id,)).fetchone()
     if not row:
         return render_page("找不到留言", '<main class="subpage wrap"><div class="empty-state large"><p>这条留言已经不存在。</p><a class="button button-primary" href="/admin/comments">返回留言管理</a></div></main>', admin=True, active="comments")
-    content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>编辑留言</h1><p>{esc(row["post_title"])} · {esc(row["ip_address"])} · {esc(fmt_date(row["created_at"]))}</p></div><a class="quiet-link" href="/admin/comments">← 返回留言列表</a></div><form class="admin-comment-edit-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>访客留言</span><textarea name="content" rows="8" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="6" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label><div class="admin-comment-edit-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
+    content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>编辑留言</h1><p>{esc(row["post_title"])} · {esc(row["ip_address"])} · {esc(fmt_datetime(row["created_at"]))}</p></div><a class="quiet-link" href="/admin/comments">← 返回留言列表</a></div><form class="admin-comment-edit-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>访客留言</span><textarea name="content" rows="8" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="6" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label><div class="admin-comment-edit-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
     return render_page("编辑留言", content, admin=True, active="comments")
 
 
