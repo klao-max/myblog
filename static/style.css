@@ -1100,3 +1100,79 @@ h1, h2, h3 { letter-spacing: -.055em; }
   .comments-head { display: block; }
   .comments-head > span { display: block; margin-top: 12px; }
 }
+
+/* Row-based admin lists: records first, actions at the trailing edge. */
+.admin-comments-list {
+  max-width: 1180px;
+}
+
+.admin-comments-table-head,
+.admin-comment-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px 150px;
+  align-items: center;
+  gap: 22px;
+}
+
+.admin-comments-table-head {
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--desk-line);
+  color: #607085;
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.admin-comment-row {
+  min-height: 104px;
+  padding: 16px;
+  border-bottom: 1px solid var(--desk-line);
+  background: rgba(18, 27, 38, .45);
+  transition: background .2s ease, border-color .2s ease;
+}
+
+.admin-comment-row:hover {
+  border-color: rgba(99, 217, 199, .38);
+  background: rgba(18, 27, 38, .82);
+}
+
+.admin-comment-row-main { min-width: 0; }
+.admin-comment-row-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.admin-comment-row-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.admin-comment-row-main p { overflow: hidden; margin: 8px 0 6px; color: #e3e8ec; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.admin-comment-row-submeta { color: var(--desk-muted); font-size: 12px; }
+.admin-comment-row-reply { color: var(--cyan); }
+.admin-comment-row-reply.is-empty { color: #607085; }
+.admin-comment-row-status { padding: 3px 7px; border: 1px solid #607085; color: #9baabc; font-size: 10px; white-space: nowrap; }
+.admin-comment-row-status.is-visible { border-color: rgba(99, 217, 199, .48); color: var(--cyan); }
+.admin-comment-row-meta { display: grid; gap: 6px; color: var(--desk-muted); font-size: 12px; }
+.admin-comment-row-meta time { color: #718196; }
+.admin-comment-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.admin-comment-row-actions form { margin: 0; }
+.admin-comment-row-actions .button { min-height: 34px; padding: 0 12px; font-size: 12px; }
+.admin-comment-edit-form { width: min(100%, 760px); display: grid; gap: 18px; }
+.admin-comment-edit-form textarea { resize: vertical; min-height: 120px; }
+.admin-comment-edit-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding-top: 16px; border-top: 1px solid var(--desk-line); }
+
+@media (max-width: 820px) {
+  .admin-comments-table-head { display: none; }
+  .admin-comment-row { grid-template-columns: minmax(0, 1fr) auto; gap: 14px; }
+  .admin-comment-row-meta { grid-column: 1 / 2; grid-row: 2; display: flex; gap: 12px; }
+  .admin-comment-row-actions { grid-column: 2; grid-row: 1 / span 2; }
+}
+
+@media (max-width: 560px) {
+  .admin-comment-row { grid-template-columns: 1fr; gap: 12px; }
+  .admin-comment-row-meta,
+  .admin-comment-row-actions { grid-column: auto; grid-row: auto; }
+  .admin-comment-row-actions { justify-content: flex-start; }
+  .admin-comment-row-actions .button { flex: 1; }
+  .admin-comment-edit-footer { align-items: stretch; flex-direction: column; }
+  .admin-comment-edit-footer .button { width: 100%; }
+}
+
+@media (max-width: 560px) {
+  .comments-section { margin-top: 72px; }
+  .comments-head { display: block; }
+  .comments-head > span { display: block; margin-top: 12px; }
+}

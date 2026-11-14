@@ -382,7 +382,7 @@ class SignalDeskTests(unittest.TestCase):
         row = self.conn.execute("SELECT content, reply, visible FROM comments WHERE id=?", (comment_id,)).fetchone()
         self.assertEqual((row["content"], row["reply"], row["visible"]), ("Edited", "已处理", 0))
 
-    def test_admin_comments_uses_clear_form_layout(self):
+    def test_admin_comments_uses_row_based_management_list(self):
         now = app.now_iso()
         self.conn.execute(
             "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -397,10 +397,10 @@ class SignalDeskTests(unittest.TestCase):
 
         html = app.admin_comments(self.conn, SimpleNamespace(session=lambda: {"csrf": "test-csrf"}))
 
-        self.assertIn('class="admin-comment-form"', html)
-        self.assertIn('class="admin-comment-fields"', html)
-        self.assertIn('class="admin-comment-actions"', html)
-        self.assertEqual(html.count('action="/admin/comments/'), 2)
+        self.assertIn('class="admin-comment-row"', html)
+        self.assertIn('class="admin-comment-row-actions"', html)
+        self.assertIn('/admin/comments/edit?id=', html)
+        self.assertEqual(html.count('action="/admin/comments/delete"'), 1)
 
 
 if __name__ == "__main__":

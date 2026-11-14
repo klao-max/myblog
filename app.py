@@ -643,11 +643,20 @@ def admin_comments(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) ->
     rows = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id ORDER BY comments.created_at DESC, comments.id DESC").fetchall()
     cards = []
     for row in rows:
-        edit_form = f'''<form class="admin-comment-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><div class="admin-comment-fields"><label class="field"><span>访客留言</span><textarea name="content" rows="5" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="5" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label></div><div class="admin-comment-form-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
         delete_form = f'''<form method="post" action="/admin/comments/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button class="button button-ghost" type="submit">删除</button></form>'''
-        cards.append(f'''<article class="admin-comment-card"><div class="admin-comment-meta"><strong>{esc(row["post_title"])}</strong><span>{esc(row["ip_address"])}</span><time>{esc(fmt_date(row["created_at"]))}</time></div>{edit_form}<div class="admin-comment-actions">{delete_form}</div></article>''')
-    content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>编辑留言、回复访客，或控制它是否出现在文章页面。</p></div></div><section class="admin-comments-list">{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>'
+        reply = f'<span class="admin-comment-row-reply">已回复：{esc(row["reply"])}</span>' if row["reply"] else '<span class="admin-comment-row-reply is-empty">待回复</span>'
+        visibility = '<span class="admin-comment-row-status is-visible">公开</span>' if row["visible"] else '<span class="admin-comment-row-status">已隐藏</span>'
+        cards.append(f'''<article class="admin-comment-row"><div class="admin-comment-row-main"><div class="admin-comment-row-title"><strong>{esc(row["post_title"])}</strong>{visibility}</div><p>{esc(row["content"])}</p><div class="admin-comment-row-submeta">{reply}</div></div><div class="admin-comment-row-meta"><span>{esc(row["ip_address"])}</span><time>{esc(fmt_date(row["created_at"]))}</time></div><div class="admin-comment-row-actions"><a class="button button-primary" href="/admin/comments/edit?id={row["id"]}">编辑 ↗</a>{delete_form}</div></article>''')
+    content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>按时间查看留言，编辑和删除操作位于每行末尾。</p></div></div><section class="admin-comments-list"><div class="admin-comments-table-head"><span>留言</span><span>来源</span><span>操作</span></div>{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>'
     return render_page("留言管理", content, admin=True, active="comments")
+
+
+def admin_comment_edit(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, comment_id: int) -> str:
+    row = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id WHERE comments.id = ?", (comment_id,)).fetchone()
+    if not row:
+        return render_page("找不到留言", '<main class="subpage wrap"><div class="empty-state large"><p>这条留言已经不存在。</p><a class="button button-primary" href="/admin/comments">返回留言管理</a></div></main>', admin=True, active="comments")
+    content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>编辑留言</h1><p>{esc(row["post_title"])} · {esc(row["ip_address"])} · {esc(fmt_date(row["created_at"]))}</p></div><a class="quiet-link" href="/admin/comments">← 返回留言列表</a></div><form class="admin-comment-edit-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>访客留言</span><textarea name="content" rows="8" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="6" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label><div class="admin-comment-edit-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
+    return render_page("编辑留言", content, admin=True, active="comments")
 
 
 def form_input(label: str, name: str, value: str = "", *, required: bool = False, placeholder: str = "", textarea: bool = False, rows: int = 8, input_type: str = "text") -> str:
@@ -829,6 +838,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/comments":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_comments(conn, self)); return
+            if path == "/admin/comments/edit":
+                if not self.is_admin(): self.redirect("/admin/login"); return
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    comment_id = int(query.get("id", ["0"])[0])
+                except ValueError:
+                    comment_id = 0
+                self.send_html(admin_comment_edit(conn, self, comment_id)); return
             if path == "/admin" or path == "/admin/":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_dashboard(conn)); return
