@@ -382,6 +382,26 @@ class SignalDeskTests(unittest.TestCase):
         row = self.conn.execute("SELECT content, reply, visible FROM comments WHERE id=?", (comment_id,)).fetchone()
         self.assertEqual((row["content"], row["reply"], row["visible"]), ("Edited", "已处理", 0))
 
+    def test_admin_comments_uses_clear_form_layout(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Commented post", "commented-post", "Excerpt", "Body", "published", now, now, now),
+        )
+        post_id = self.conn.execute("SELECT id FROM posts WHERE slug='commented-post'").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO comments(post_id, content, ip_address, reply, visible, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (post_id, "Original", "203.0.113.5", "", 1, now, now),
+        )
+        self.conn.commit()
+
+        html = app.admin_comments(self.conn, SimpleNamespace(session=lambda: {"csrf": "test-csrf"}))
+
+        self.assertIn('class="admin-comment-form"', html)
+        self.assertIn('class="admin-comment-fields"', html)
+        self.assertIn('class="admin-comment-actions"', html)
+        self.assertEqual(html.count('action="/admin/comments/'), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
