@@ -55,6 +55,7 @@ class SignalDeskTests(unittest.TestCase):
         conn.execute("DELETE FROM games")
         conn.execute("DELETE FROM site_images")
         conn.execute("DELETE FROM site_gallery_settings")
+        conn.execute("DELETE FROM comments")
         conn.commit()
         self.conn = conn
 
@@ -309,6 +310,77 @@ class SignalDeskTests(unittest.TestCase):
         self.assertIn('</a><time class="timeline-date"', timeline_html)
         self.assertIn("The latest excerpt", timeline_html)
         self.assertLess(timeline_html.index("Newest note"), timeline_html.index("Older note"))
+    def test_public_comment_is_saved_with_ip_and_visible(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Commented post", "commented-post", "Excerpt", "Body", "published", now, now, now),
+        )
+        self.conn.commit()
+        body = urlencode({"content": "A useful suggestion", "website": ""}).encode()
+        handler = make_handler(
+            "/blog/commented-post/comments",
+            body,
+            {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body))},
+        )
+        handler.client_address = ("203.0.113.5", 12345)
+
+        app.Handler.do_POST(handler)
+
+        row = self.conn.execute("SELECT content, ip_address, visible FROM comments").fetchone()
+        self.assertEqual((row["content"], row["ip_address"], row["visible"]), ("A useful suggestion", "203.0.113.5", 1))
+        self.assertIn("Location: /blog/commented-post", handler.wfile.getvalue().decode("latin-1"))
+
+    def test_comment_rate_limit_blocks_fourth_submission_in_window(self):
+        app.COMMENT_SUBMISSIONS.clear()
+        for _ in range(app.COMMENT_MAX_SUBMISSIONS):
+            app.record_comment_submission("203.0.113.8", now=100.0)
+        self.assertTrue(app.comment_rate_limited("203.0.113.8", now=101.0))
+        self.assertFalse(app.comment_rate_limited("203.0.113.8", now=app.COMMENT_WINDOW_SECONDS + 101.0))
+
+    def test_comment_content_is_escaped_on_article_page(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Commented post", "commented-post", "Excerpt", "Body", "published", now, now, now),
+        )
+        post_id = self.conn.execute("SELECT id FROM posts WHERE slug='commented-post'").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO comments(post_id, content, ip_address, reply, visible, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (post_id, "<script>alert(1)</script>", "203.0.113.5", "Thanks", 1, now, now),
+        )
+        self.conn.commit()
+
+        status, html = app.detail(self.conn, "blog", "commented-post")
+
+        self.assertEqual(status, 200)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("Thanks", html)
+
+    def test_admin_can_edit_reply_and_visibility(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Commented post", "commented-post", "Excerpt", "Body", "published", now, now, now),
+        )
+        post_id = self.conn.execute("SELECT id FROM posts WHERE slug='commented-post'").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO comments(post_id, content, ip_address, reply, visible, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (post_id, "Original", "203.0.113.5", "", 1, now, now),
+        )
+        comment_id = self.conn.execute("SELECT id FROM comments").fetchone()[0]
+        self.conn.commit()
+        token = "comment-admin-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body = urlencode({"csrf": "integration-csrf", "id": str(comment_id), "content": "Edited", "reply": "已处理", "visible": ""}).encode()
+        handler = make_handler("/admin/comments/save", body, {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body)), "Cookie": app.build_session_cookie(token)})
+
+        app.Handler.do_POST(handler)
+
+        row = self.conn.execute("SELECT content, reply, visible FROM comments WHERE id=?", (comment_id,)).fetchone()
+        self.assertEqual((row["content"], row["reply"], row["visible"]), ("Edited", "已处理", 0))
+
 
 
 if __name__ == "__main__":

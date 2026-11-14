@@ -32,6 +32,9 @@ SESSION_SECRET = os.getenv("SESSION_SECRET")
 MAX_BODY_BYTES = 256 * 1024
 MAX_MEDIA_BYTES = 8 * 1024 * 1024
 MAX_MULTIPART_BODY_BYTES = MAX_MEDIA_BYTES * 9 + 512 * 1024
+MAX_COMMENT_CHARS = 2000
+COMMENT_WINDOW_SECONDS = 600
+COMMENT_MAX_SUBMISSIONS = 3
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 10
 
@@ -44,6 +47,7 @@ ALLOWED_MEDIA_TYPES = {
 
 SESSIONS: dict[str, dict[str, str]] = {}
 LOGIN_FAILURES: dict[str, list[float]] = {}
+COMMENT_SUBMISSIONS: dict[str, list[float]] = {}
 
 
 class RequestTooLarge(ValueError):
@@ -171,6 +175,16 @@ CREATE TABLE IF NOT EXISTS site_gallery_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   effect TEXT NOT NULL DEFAULT 'fade',
   interval INTEGER NOT NULL DEFAULT 5,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  ip_address TEXT NOT NULL,
+  reply TEXT NOT NULL DEFAULT '',
+  visible INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 """
@@ -435,6 +449,7 @@ def render_page(title: str, content: str, *, admin: bool = False, active: str = 
         <a class=\"rail-link {"is-active" if active == "projects" else ""}\" href=\"/admin/projects\">项目 <span>↗</span></a>
         <a class=\"rail-link {"is-active" if active == "games" else ""}\" href=\"/admin/games\">游戏 <span>▶</span></a>
         <a class=\"rail-link {"is-active" if active == "media" else ""}\" href=\"/admin/media\">图库 <span>▧</span></a>
+        <a class=\"rail-link {"is-active" if active == "comments" else ""}\" href=\"/admin/comments\">留言 <span>✦</span></a>
         <div class=\"rail-bottom\"><p class=\"rail-label\">状态</p><p class=\"rail-note\">本地 SQLite<br>Docker-ready</p></div></aside><main class=\"admin-main\">{content}</main></div>
         """
     else:
@@ -536,7 +551,7 @@ def detail(conn: sqlite3.Connection, kind: str, slug: str) -> tuple[int, str]:
     if not row or (kind == "blog" and row["status"] != "published") or (kind == "games" and row["status"] != "published") or (kind == "projects" and row["status"] == "archived"):
         return 404, render_page("找不到内容", '<main class="subpage wrap"><div class="empty-state large"><p>这条内容不存在，或者还在草稿箱里。</p><a class="button button-primary" href="/">回到首页</a></div></main>')
     if kind == "blog":
-        body = f"""<main class=\"article-page wrap\"><a class=\"back-link\" href=\"/blog\">← 返回文章</a><div class=\"article-head\"><p class=\"kicker\">{fmt_date(row['published_at'])} · {" / ".join(tags(row['tags']))}</p><h1>{esc(row['title'])}</h1><p class=\"article-lead\">{esc(row['excerpt'])}</p></div><article class=\"article-body\">{markdown(row['body'])}</article></main>"""
+        body = f"""<main class=\"article-page wrap\"><a class=\"back-link\" href=\"/blog\">← 返回文章</a><div class=\"article-head\"><p class=\"kicker\">{fmt_date(row['published_at'])} · {" / ".join(tags(row['tags']))}</p><h1>{esc(row['title'])}</h1><p class=\"article-lead\">{esc(row['excerpt'])}</p></div><article class=\"article-body\">{markdown(row['body'])}</article>{comment_section(conn, row['id'], slug)}</main>"""
         return 200, render_page(row["title"], body, active="blog")
     if kind == "projects":
         links = (f'<a class="button button-primary" target="_blank" rel="noreferrer" href="{esc(row["github_url"])}">打开 GitHub ↗</a>' if row["github_url"] else "") + (f'<a class="button button-secondary" target="_blank" rel="noreferrer" href="{esc(row["demo_url"])}">查看 Demo ↗</a>' if row["demo_url"] else "")
@@ -596,6 +611,26 @@ def admin_media(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> st
         cards.append(f'<article class="media-card"><span class="media-card__order" aria-label="顺序 {index}">{index}</span><img src="/media/gallery/{quote(row["stored_name"])}" alt="{esc(row["original_name"])}"><strong>{esc(row["original_name"])}</strong>{controls}{delete}</article>')
     content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / MEDIA</p><h1>图库</h1><p>管理首页背景图片，最多保留 9 张。</p></div></div><form method="post" action="/admin/media/upload" enctype="multipart/form-data">{csrf_for(handler)}<input type="file" name="files" accept="image/jpeg,image/png,image/webp,image/gif" multiple required><button type="submit">上传图片</button></form><section class="media-grid">{"".join(cards) or "<p class=\"empty-state\">还没有图片。</p>"}</section><form method="post" action="/admin/media/settings">{csrf_for(handler)}{select_input("切换效果", "effect", effect, [("fade", "淡入淡出"), ("slide", "滑动"), ("zoom", "缩放")])}<button type="submit">保存效果</button></form>'
     return render_page("图库", content, admin=True, active="media")
+
+
+def comment_section(conn: sqlite3.Connection, post_id: int, slug: str) -> str:
+    rows = conn.execute("SELECT * FROM comments WHERE post_id = ? AND visible = 1 ORDER BY created_at DESC, id DESC", (post_id,)).fetchall()
+    cards = []
+    for row in rows:
+        reply = f'<div class="comment-reply"><strong>站长回复</strong><p>{esc(row["reply"])}</p></div>' if row["reply"] else ""
+        cards.append(f'<article class="comment-card"><time>{esc(fmt_date(row["created_at"]))}</time><p>{esc(row["content"])}</p>{reply}</article>')
+    return f'''<section class="comments-section" aria-labelledby="comments-title"><div class="comments-head"><div><p class="kicker">OPEN NOTES</p><h2 id="comments-title">留下你的建议</h2></div><span>{len(rows)} 条留言</span></div><form class="comment-form" method="post" action="/blog/{quote(slug)}/comments"><label class="field"><span>留言内容</span><textarea name="content" rows="5" maxlength="{MAX_COMMENT_CHARS}" required placeholder="写下你的想法、问题或建议"></textarea></label><label class="comment-honeypot" aria-hidden="true">网站<input name="website" tabindex="-1" autocomplete="off"></label><button class="button button-primary" type="submit">发布留言 <span>↗</span></button></form><div class="comment-list">{"".join(cards) or '<p class="empty-state">还没有留言，欢迎留下第一条建议。</p>'}</div></section>'''
+
+
+def admin_comments(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> str:
+    rows = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id ORDER BY comments.created_at DESC, comments.id DESC").fetchall()
+    cards = []
+    for row in rows:
+        edit_form = f'''<form method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>留言</span><textarea name="content" rows="4" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>回复</span><textarea name="reply" rows="3" maxlength="{MAX_COMMENT_CHARS}">{esc(row["reply"])}</textarea></label><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存留言</button></form>'''
+        delete_form = f'''<form method="post" action="/admin/comments/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button class="button button-ghost" type="submit">删除</button></form>'''
+        cards.append(f'''<article class="admin-comment-card"><div class="admin-comment-meta"><strong>{esc(row["post_title"])}</strong><span>{esc(row["ip_address"])}</span><time>{esc(fmt_date(row["created_at"]))}</time></div>{edit_form}<div class="admin-comment-actions">{delete_form}</div></article>''')
+    content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>编辑留言、回复访客，或控制它是否出现在文章页面。</p></div></div><section class="admin-comments-list">{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>'
+    return render_page("留言管理", content, admin=True, active="comments")
 
 
 def form_input(label: str, name: str, value: str = "", *, required: bool = False, placeholder: str = "", textarea: bool = False, rows: int = 8, input_type: str = "text") -> str:
@@ -774,6 +809,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/media":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_media(conn, self)); return
+            if path == "/admin/comments":
+                if not self.is_admin(): self.redirect("/admin/login"); return
+                self.send_html(admin_comments(conn, self)); return
             if path == "/admin" or path == "/admin/":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_dashboard(conn)); return
@@ -844,10 +882,49 @@ class Handler(BaseHTTPRequestHandler):
                     SESSIONS.pop(token, None)
                 self.redirect("/", cookie=clear_session_cookie())
                 return
+            comment_match = re.match(r"^/blog/([^/]+)/comments$", path)
+            if comment_match:
+                slug = comment_match.group(1)
+                post = conn.execute("SELECT id FROM posts WHERE slug = ? AND status = 'published'", (slug,)).fetchone()
+                if not post:
+                    self.send_error(404)
+                    return
+                if form.get("website", "").strip():
+                    self.redirect(f"/blog/{quote(slug)}")
+                    return
+                ip_address = self.client_address[0]
+                if comment_rate_limited(ip_address):
+                    self.send_error(429, "留言过于频繁，请稍后再试")
+                    return
+                content = form.get("content", "").strip()
+                if not content or len(content) > MAX_COMMENT_CHARS:
+                    raise ValueError(f"留言不能为空且不能超过 {MAX_COMMENT_CHARS} 字")
+                timestamp = now_iso()
+                conn.execute("INSERT INTO comments(post_id, content, ip_address, reply, visible, created_at, updated_at) VALUES (?, ?, ?, '', 1, ?, ?)", (post["id"], content, ip_address, timestamp, timestamp))
+                conn.commit()
+                record_comment_submission(ip_address)
+                self.redirect(f"/blog/{quote(slug)}")
+                return
             if not self.is_admin():
                 self.redirect("/admin/login"); return
             if form.get("csrf") != self.session().get("csrf"):
                 self.send_html(render_page("请求失效", '<main class="subpage wrap"><div class="empty-state large"><p>编辑会话已失效，请返回后台重试。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 403); return
+            if path == "/admin/comments/save":
+                comment_id = int(form.get("id", "0"))
+                content = form.get("content", "").strip()
+                reply = form.get("reply", "").strip()
+                if not content or len(content) > MAX_COMMENT_CHARS or len(reply) > MAX_COMMENT_CHARS:
+                    raise ValueError(f"留言和回复不能超过 {MAX_COMMENT_CHARS} 字，留言不能为空")
+                conn.execute("UPDATE comments SET content=?, reply=?, visible=?, updated_at=? WHERE id=?", (content, reply, 1 if form.get("visible") == "on" else 0, now_iso(), comment_id))
+                conn.commit()
+                self.redirect("/admin/comments")
+                return
+            if path == "/admin/comments/delete":
+                comment_id = int(form.get("id", "0"))
+                conn.execute("DELETE FROM comments WHERE id=?", (comment_id,))
+                conn.commit()
+                self.redirect("/admin/comments")
+                return
             if path == "/admin/media/upload":
                 count = conn.execute("SELECT COUNT(*) FROM site_images").fetchone()[0]
                 if count + len(files) > 9: raise ValueError("最多 9 张图片")
