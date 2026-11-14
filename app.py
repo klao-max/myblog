@@ -937,7 +937,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 ip_address = self.client_address[0]
                 if comment_rate_limited(ip_address):
-                    self.send_error(429, "留言过于频繁，请稍后再试")
+                    self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>留言过于频繁，请稍后再试</p></div></main>', 429)
                     return
                 content = form.get("content", "").strip()
                 if not content or len(content) > MAX_COMMENT_CHARS:

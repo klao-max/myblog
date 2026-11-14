@@ -339,6 +339,38 @@ class SignalDeskTests(unittest.TestCase):
         self.assertTrue(app.comment_rate_limited("203.0.113.8", now=101.0))
         self.assertFalse(app.comment_rate_limited("203.0.113.8", now=app.COMMENT_WINDOW_SECONDS + 101.0))
 
+    def test_comment_rate_limit_returns_parseable_429(self):
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Rate limited post", "rate-limited-post", "Excerpt", "Body", "published", now, now, now),
+        )
+        self.conn.commit()
+        ip_address = "203.0.113.8"
+        app.COMMENT_SUBMISSIONS.clear()
+        for _ in range(app.COMMENT_MAX_SUBMISSIONS):
+            app.record_comment_submission(ip_address)
+        body = urlencode({"content": "Fourth suggestion", "website": ""}).encode()
+        handler = make_handler(
+            "/blog/rate-limited-post/comments",
+            body,
+            {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body))},
+        )
+        handler.client_address = (ip_address, 12345)
+
+        app.Handler.do_POST(handler)
+
+        response_text = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("429 Too Many Requests", response_text)
+        self.assertIn("留言过于频繁，请稍后再试", response_text)
+
+    def test_comment_cards_wrap_unbroken_text(self):
+        css = (Path(app.ROOT) / "static" / "style.css").read_text()
+        rule_start = css.index(".comment-card p")
+        rule_end = css.index("}", rule_start)
+        comment_rule = css[rule_start:rule_end]
+        self.assertIn("overflow-wrap: anywhere", comment_rule)
+
     def test_comment_content_is_escaped_on_article_page(self):
         now = app.now_iso()
         self.conn.execute(

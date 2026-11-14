@@ -782,7 +782,7 @@ h1, h2, h3 { letter-spacing: -.055em; }
 .comment-list { display: grid; gap: 14px; }
 .comment-card { padding: 20px; border: 1px solid rgba(17, 22, 29, .2); background: rgba(255, 255, 255, .26); }
 .comment-card time { display: block; margin-bottom: 12px; color: var(--orange-deep); font-size: 11px; letter-spacing: .12em; }
-.comment-card p { margin-bottom: 0; color: var(--ink-soft); line-height: 1.65; white-space: pre-wrap; }
+.comment-card p { margin-bottom: 0; color: var(--ink-soft); line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .comment-reply { margin-top: 18px; padding: 14px 16px; border-left: 2px solid var(--orange); background: rgba(255, 138, 61, .08); }
 .comment-reply strong { display: block; margin-bottom: 6px; color: var(--ink); font-size: 12px; }
 .admin-comments-list { display: grid; gap: 18px; }
