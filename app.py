@@ -780,6 +780,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
         self.send_header("Content-Length", str(len(content)))
+        if root is not None and root.resolve() == (ROOT / "static").resolve():
+            self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         self.wfile.write(content)
 

@@ -371,6 +371,18 @@ class SignalDeskTests(unittest.TestCase):
         comment_rule = css[rule_start:rule_end]
         self.assertIn("overflow-wrap: anywhere", comment_rule)
 
+    def test_static_assets_are_cacheable(self):
+        handler = app.Handler.__new__(app.Handler)
+        headers = {}
+        handler.send_response = lambda status: None
+        handler.send_header = lambda name, value: headers.__setitem__(name, value)
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+
+        handler.serve_file(Path(app.ROOT) / "static" / "style.css", Path(app.ROOT) / "static")
+
+        self.assertEqual(headers["Cache-Control"], "public, max-age=3600")
+
     def test_comment_content_is_escaped_on_article_page(self):
         now = app.now_iso()
         self.conn.execute(
