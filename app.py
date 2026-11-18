@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +48,8 @@ PUBLIC_COMMENT_LIMIT = 50
 FILE_CHUNK_BYTES = 64 * 1024
 COMMENT_WINDOW_SECONDS = 600
 COMMENT_MAX_SUBMISSIONS = 3
+COMMENT_IP_RETENTION_DAYS = 90
+COMMENT_IP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 10
 MAX_RATE_ENTRIES = 10_000
@@ -73,6 +75,7 @@ SESSIONS: dict[str, dict[str, object]] = {}
 LOGIN_FAILURES: dict[str, list[float]] = {}
 COMMENT_SUBMISSIONS: dict[str, list[float]] = {}
 STATE_LOCK = threading.RLock()
+_last_comment_ip_cleanup_at = 0.0
 
 
 class RequestTooLarge(ValueError):
@@ -371,6 +374,33 @@ def record_comment_submission(ip: str, now: float | None = None) -> None:
         _trim_rate_store(COMMENT_SUBMISSIONS)
 
 
+def purge_expired_comment_ips(conn: sqlite3.Connection, now: str | datetime | None = None) -> int:
+    if now is None:
+        current = datetime.now(timezone.utc)
+    elif isinstance(now, datetime):
+        current = now.astimezone(timezone.utc)
+    else:
+        current = datetime.fromisoformat(now).astimezone(timezone.utc)
+    cutoff = (current - timedelta(days=COMMENT_IP_RETENTION_DAYS)).isoformat(timespec="seconds")
+    result = conn.execute(
+        "UPDATE comments SET ip_address = '' WHERE created_at < ? AND ip_address <> ''",
+        (cutoff,),
+    )
+    conn.commit()
+    return result.rowcount
+
+
+def maybe_cleanup_comment_ips(conn: sqlite3.Connection) -> int:
+    global _last_comment_ip_cleanup_at
+    current = time.time()
+    with STATE_LOCK:
+        if current - _last_comment_ip_cleanup_at < COMMENT_IP_CLEANUP_INTERVAL_SECONDS:
+            return 0
+        cleaned = purge_expired_comment_ips(conn)
+        _last_comment_ip_cleanup_at = current
+        return cleaned
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -424,6 +454,7 @@ def db() -> sqlite3.Connection:
     conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode = WAL")
     initialize_database(conn, seed_data=database_is_new)
+    maybe_cleanup_comment_ips(conn)
     return conn
 
 
@@ -912,7 +943,8 @@ def admin_comments(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, *,
         delete_form = f'''<form method="post" action="/admin/comments/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button class="button button-ghost" type="submit">删除</button></form>'''
         reply = f'<span class="admin-comment-row-reply">已回复：{esc(row["reply"])}</span>' if row["reply"] else '<span class="admin-comment-row-reply is-empty">待回复</span>'
         visibility = '<span class="admin-comment-row-status is-visible">公开</span>' if row["visible"] else '<span class="admin-comment-row-status">已隐藏</span>'
-        cards.append(f'''<article class="admin-comment-row"><div class="admin-comment-row-main"><div class="admin-comment-row-title"><strong>{esc(row["post_title"])}</strong>{visibility}</div><p>{esc(row["content"])}</p><div class="admin-comment-row-submeta">{reply}</div></div><div class="admin-comment-row-meta"><span>{esc(row["ip_address"])}</span><time>{esc(fmt_datetime(row["created_at"]))}</time></div><div class="admin-comment-row-actions"><a class="button button-primary" href="/admin/comments/edit?id={row["id"]}">编辑 ↗</a>{delete_form}</div></article>''')
+        ip_address = row["ip_address"] or "已清理"
+        cards.append(f'''<article class="admin-comment-row"><div class="admin-comment-row-main"><div class="admin-comment-row-title"><strong>{esc(row["post_title"])}</strong>{visibility}</div><p>{esc(row["content"])}</p><div class="admin-comment-row-submeta">{reply}</div></div><div class="admin-comment-row-meta"><span>{esc(ip_address)}</span><time>{esc(fmt_datetime(row["created_at"]))}</time></div><div class="admin-comment-row-actions"><a class="button button-primary" href="/admin/comments/edit?id={row["id"]}">编辑 ↗</a>{delete_form}</div></article>''')
     content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>按时间查看留言，编辑和删除操作位于每行末尾。</p></div></div><section class="admin-comments-list"><div class="admin-comments-table-head"><span>留言</span><span>来源</span><span>操作</span></div>{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>{pagination_nav("/admin/comments", page, has_next)}'
     return render_page("留言管理", content, admin=True, active="comments", csrf_token=str(handler.session().get("csrf", "")))
 
@@ -921,7 +953,8 @@ def admin_comment_edit(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler
     row = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id WHERE comments.id = ?", (comment_id,)).fetchone()
     if not row:
         return render_page("找不到留言", '<main class="subpage wrap"><div class="empty-state large"><p>这条留言已经不存在。</p><a class="button button-primary" href="/admin/comments">返回留言管理</a></div></main>', admin=True, active="comments", csrf_token=str(handler.session().get("csrf", "")))
-    content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>编辑留言</h1><p>{esc(row["post_title"])} · {esc(row["ip_address"])} · {esc(fmt_datetime(row["created_at"]))}</p></div><a class="quiet-link" href="/admin/comments">← 返回留言列表</a></div><form class="admin-comment-edit-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>访客留言</span><textarea name="content" rows="8" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="6" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label><div class="admin-comment-edit-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
+    ip_address = row["ip_address"] or "已清理"
+    content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>编辑留言</h1><p>{esc(row["post_title"])} · {esc(ip_address)} · {esc(fmt_datetime(row["created_at"]))}</p></div><a class="quiet-link" href="/admin/comments">← 返回留言列表</a></div><form class="admin-comment-edit-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>访客留言</span><textarea name="content" rows="8" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="6" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label><div class="admin-comment-edit-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
     return render_page("编辑留言", content, admin=True, active="comments", csrf_token=str(handler.session().get("csrf", "")))
 
 

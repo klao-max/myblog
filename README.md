@@ -26,6 +26,8 @@ Compose 已包含博客应用和 Caddy 反向代理，生产域名固定为：
 
 <https://blog.kangmouren.online>
 
+Compose 使用固定版本和多架构 manifest digest 的 Python、Caddy 镜像，更新镜像时应同步重新验证摘要。
+
 先在腾讯云 DNS 中添加一条记录：
 
 ```text
@@ -89,6 +91,18 @@ SQLite 和上传文件都存在 Docker volume `myblog_data` 中，重启容器�
 
 图库文件也会持久化在同一个 volume：数据库位于 `/data/blog.db`，上传的背景图片位于 `/data/uploads/gallery/`。停止或重新创建容器时保留 `myblog_data` 即可保留图片；不要使用 `docker compose down -v`，因为该命令会删除 volume 及其中的数据库和上传文件。部署前请按自己的 Docker 运维流程备份 `myblog_data`。
 
+### 数据备份与恢复演练
+
+备份工具只使用 Python 标准库，会对 SQLite 数据库执行一致性备份，并记录数据库和上传文件的 SHA-256 校验值：
+
+```bash
+python scripts/data_backup.py backup --data-dir ./data --output ./backups/$(date +%Y%m%d-%H%M%S)
+python scripts/data_backup.py verify --backup-dir ./backups/20261118-120000
+python scripts/data_backup.py restore --backup-dir ./backups/20261118-120000 --data-dir ./restore-test
+```
+
+恢复到已有数据目录前必须显式传入 `--replace`。建议定期在临时目录执行一次恢复和 `verify`，确认数据库记录与图库文件都能还原。
+
 ## 管理首页背景图库
 
 登录后台后打开 <http://127.0.0.1:8001/admin/media>（直接运行 `python app.py` 时使用端口 8000）。在“图库”页面可以：
@@ -104,7 +118,7 @@ SQLite 和上传文件都存在 Docker volume `myblog_data` 中，重启容器�
 
 已发布文章底部提供公开留言区，访客无需登录即可提交建议。留言提交后立即显示；管理员可在 <http://127.0.0.1:8001/admin/comments>（直接运行时使用 8000 端口）查看文章、留言时间和 IP，并编辑留言、填写回复、隐藏/恢复显示或删除。
 
-留言只保存纯文本，单条最多 2000 字；公开页面不会显示 IP。系统按 IP 做短时间提交频率限制，并使用隐藏字段拦截常见机器人提交。
+留言只保存纯文本，单条最多 2000 字；公开页面不会显示 IP。系统按 IP 做短时间提交频率限制，并使用隐藏字段拦截常见机器人提交。IP 地址最多保留 90 天，应用启动后的定时清理会将过期记录脱敏为空值，留言内容和回复仍然保留。
 
 ## 添加游戏
 

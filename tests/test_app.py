@@ -485,6 +485,22 @@ class SignalDeskTests(unittest.TestCase):
         self.assertEqual((row["content"], row["ip_address"], row["visible"]), ("A useful suggestion", "203.0.113.5", 1))
         self.assertIn("Location: /blog/commented-post", handler.wfile.getvalue().decode("latin-1"))
 
+    def test_comment_ip_retention_cleanup_removes_only_expired_addresses(self):
+        self.conn.executemany(
+            "INSERT INTO comments(post_id, content, ip_address, reply, visible, created_at, updated_at) VALUES (0, ?, ?, '', 1, ?, ?)",
+            [
+                ("old", "203.0.113.10", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                ("new", "203.0.113.11", "2026-11-17T00:00:00+00:00", "2026-11-17T00:00:00+00:00"),
+            ],
+        )
+        self.conn.commit()
+
+        cleaned = app.purge_expired_comment_ips(self.conn, now="2026-11-18T00:00:00+00:00")
+
+        rows = self.conn.execute("SELECT content, ip_address FROM comments ORDER BY id").fetchall()
+        self.assertEqual(cleaned, 1)
+        self.assertEqual([(row["content"], row["ip_address"]) for row in rows], [("old", ""), ("new", "203.0.113.11")])
+
     def test_comment_rate_limit_blocks_fourth_submission_in_window(self):
         app.COMMENT_SUBMISSIONS.clear()
         for _ in range(app.COMMENT_MAX_SUBMISSIONS):
@@ -844,6 +860,13 @@ class SignalDeskTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("2026.11.15 12:34", public_html)
         self.assertIn("2026.11.15 12:34", admin_html)
+
+    def test_docker_images_are_digest_pinned(self):
+        dockerfile = (Path(app.ROOT) / "Dockerfile").read_text()
+        compose = (Path(app.ROOT) / "compose.yaml").read_text()
+
+        self.assertRegex(dockerfile.splitlines()[0], r"^FROM python:\S+@sha256:[0-9a-f]{64}$", msg=dockerfile)
+        self.assertRegex(compose, r"image:\s+caddy:\S+@sha256:[0-9a-f]{64}")
 
 
 if __name__ == "__main__":
