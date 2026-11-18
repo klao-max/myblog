@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -33,10 +34,26 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_MEDIA_BYTES = 8 * 1024 * 1024
 MAX_MULTIPART_BODY_BYTES = MAX_MEDIA_BYTES * 9 + 512 * 1024
 MAX_COMMENT_CHARS = 2000
+MAX_TITLE_CHARS = 200
+MAX_SUMMARY_CHARS = 500
+MAX_BODY_CHARS = 100_000
+MAX_DESCRIPTION_CHARS = 100_000
+MAX_TAGS_CHARS = 500
+MAX_CONTROLS_CHARS = 500
+MAX_SLUG_CHARS = 120
+MAX_URL_CHARS = 2048
+PAGE_SIZE = 20
+MAX_PAGE_SIZE = 50
+PUBLIC_COMMENT_LIMIT = 50
+FILE_CHUNK_BYTES = 64 * 1024
 COMMENT_WINDOW_SECONDS = 600
 COMMENT_MAX_SUBMISSIONS = 3
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 10
+MAX_RATE_ENTRIES = 10_000
+SESSION_TTL_SECONDS = 12 * 60 * 60
+SQLITE_BUSY_TIMEOUT_MS = 5000
+SCHEMA_VERSION = 1
 
 ALLOWED_MEDIA_TYPES = {
     "image/jpeg": {".jpg", ".jpeg"},
@@ -45,9 +62,17 @@ ALLOWED_MEDIA_TYPES = {
     "image/gif": {".gif"},
 }
 
-SESSIONS: dict[str, dict[str, str]] = {}
+MEDIA_SIGNATURES = {
+    "image/jpeg": lambda payload: payload.startswith(b"\xff\xd8"),
+    "image/png": lambda payload: payload.startswith(b"\x89PNG\r\n\x1a\n"),
+    "image/gif": lambda payload: payload.startswith((b"GIF87a", b"GIF89a")),
+    "image/webp": lambda payload: len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WEBP",
+}
+
+SESSIONS: dict[str, dict[str, object]] = {}
 LOGIN_FAILURES: dict[str, list[float]] = {}
 COMMENT_SUBMISSIONS: dict[str, list[float]] = {}
+STATE_LOCK = threading.RLock()
 
 
 class RequestTooLarge(ValueError):
@@ -95,26 +120,54 @@ def verify_session_cookie(value: str) -> str | None:
     return token
 
 
+def _trim_rate_store(store: dict[str, list[float]]) -> None:
+    overflow = len(store) - MAX_RATE_ENTRIES
+    if overflow > 0:
+        for key in list(store)[:overflow]:
+            store.pop(key, None)
+
+
+def revoke_admin_sessions(admin_id: str) -> None:
+    with STATE_LOCK:
+        for token, session in list(SESSIONS.items()):
+            if str(session.get("admin_id", "")) == str(admin_id):
+                SESSIONS.pop(token, None)
+
+
 def _login_attempts(ip: str, now: float | None = None) -> list[float]:
-    now = now if now is not None else time.time()
-    attempts = [stamp for stamp in LOGIN_FAILURES.get(ip, []) if now - stamp < LOGIN_WINDOW_SECONDS]
-    LOGIN_FAILURES[ip] = attempts
-    return attempts
+    with STATE_LOCK:
+        now = now if now is not None else time.time()
+        attempts = [stamp for stamp in LOGIN_FAILURES.get(ip, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+        if attempts:
+            LOGIN_FAILURES[ip] = attempts
+        else:
+            LOGIN_FAILURES.pop(ip, None)
+        _trim_rate_store(LOGIN_FAILURES)
+        return attempts
 
 
 def record_login_failure(ip: str, now: float | None = None) -> None:
-    now = now if now is not None else time.time()
-    _login_attempts(ip, now).append(now)
+    with STATE_LOCK:
+        now = now if now is not None else time.time()
+        attempts = _login_attempts(ip, now)
+        attempts.append(now)
+        LOGIN_FAILURES[ip] = attempts
+        _trim_rate_store(LOGIN_FAILURES)
 
 
 def clear_login_failures(ip: str) -> None:
-    LOGIN_FAILURES.pop(ip, None)
+    with STATE_LOCK:
+        LOGIN_FAILURES.pop(ip, None)
 
 
 def is_login_rate_limited(ip: str, now: float | None = None) -> bool:
     return len(_login_attempts(ip, now)) >= LOGIN_MAX_ATTEMPTS
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS admins (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
@@ -190,6 +243,75 @@ CREATE TABLE IF NOT EXISTS comments (
 """
 
 
+REQUIRED_COLUMNS = {
+    "admins": {
+        "username": "TEXT UNIQUE NOT NULL",
+        "password_hash": "TEXT NOT NULL",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "posts": {
+        "title": "TEXT NOT NULL DEFAULT ''",
+        "slug": "TEXT UNIQUE NOT NULL DEFAULT ''",
+        "excerpt": "TEXT NOT NULL DEFAULT ''",
+        "body": "TEXT NOT NULL DEFAULT ''",
+        "tags": "TEXT NOT NULL DEFAULT ''",
+        "cover": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'draft'",
+        "published_at": "TEXT",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "projects": {
+        "name": "TEXT NOT NULL DEFAULT ''",
+        "slug": "TEXT UNIQUE NOT NULL DEFAULT ''",
+        "summary": "TEXT NOT NULL DEFAULT ''",
+        "description": "TEXT NOT NULL DEFAULT ''",
+        "tech_stack": "TEXT NOT NULL DEFAULT ''",
+        "github_url": "TEXT NOT NULL DEFAULT ''",
+        "demo_url": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'active'",
+        "featured": "INTEGER NOT NULL DEFAULT 0",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "games": {
+        "name": "TEXT NOT NULL DEFAULT ''",
+        "slug": "TEXT UNIQUE NOT NULL DEFAULT ''",
+        "summary": "TEXT NOT NULL DEFAULT ''",
+        "description": "TEXT NOT NULL DEFAULT ''",
+        "controls": "TEXT NOT NULL DEFAULT ''",
+        "source_url": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'published'",
+        "featured": "INTEGER NOT NULL DEFAULT 0",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "site_images": {
+        "stored_name": "TEXT UNIQUE NOT NULL DEFAULT ''",
+        "original_name": "TEXT NOT NULL DEFAULT ''",
+        "mime_type": "TEXT NOT NULL DEFAULT ''",
+        "size": "INTEGER NOT NULL DEFAULT 0",
+        "sort_order": "INTEGER NOT NULL DEFAULT 0",
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "site_gallery_settings": {
+        "effect": "TEXT NOT NULL DEFAULT 'fade'",
+        "interval": "INTEGER NOT NULL DEFAULT 5",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "comments": {
+        "post_id": "INTEGER NOT NULL DEFAULT 0",
+        "content": "TEXT NOT NULL DEFAULT ''",
+        "ip_address": "TEXT NOT NULL DEFAULT ''",
+        "reply": "TEXT NOT NULL DEFAULT ''",
+        "visible": "INTEGER NOT NULL DEFAULT 1",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -198,6 +320,10 @@ def gallery_dir() -> Path:
     path = DATA_DIR / "uploads" / "gallery"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def remove_gallery_file(path: Path) -> None:
+    path.unlink()
 
 
 def validate_gallery_upload(filename: str, content_type: str, payload: bytes) -> tuple[str, str]:
@@ -209,6 +335,8 @@ def validate_gallery_upload(filename: str, content_type: str, payload: bytes) ->
         raise ValueError("不支持的图片类型")
     if suffix not in ALLOWED_MEDIA_TYPES[mime_type]:
         raise ValueError("文件扩展名与图片类型不匹配")
+    if not MEDIA_SIGNATURES[mime_type](payload):
+        raise ValueError("图片内容与声明类型不匹配")
     return suffix, mime_type
 
 
@@ -219,10 +347,15 @@ def gallery_images(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def comment_attempts(ip: str, now: float | None = None) -> list[float]:
-    now = now if now is not None else time.time()
-    attempts = [stamp for stamp in COMMENT_SUBMISSIONS.get(ip, []) if now - stamp < COMMENT_WINDOW_SECONDS]
-    COMMENT_SUBMISSIONS[ip] = attempts
-    return attempts
+    with STATE_LOCK:
+        now = now if now is not None else time.time()
+        attempts = [stamp for stamp in COMMENT_SUBMISSIONS.get(ip, []) if now - stamp < COMMENT_WINDOW_SECONDS]
+        if attempts:
+            COMMENT_SUBMISSIONS[ip] = attempts
+        else:
+            COMMENT_SUBMISSIONS.pop(ip, None)
+        _trim_rate_store(COMMENT_SUBMISSIONS)
+        return attempts
 
 
 def comment_rate_limited(ip: str, now: float | None = None) -> bool:
@@ -230,17 +363,85 @@ def comment_rate_limited(ip: str, now: float | None = None) -> bool:
 
 
 def record_comment_submission(ip: str, now: float | None = None) -> None:
-    now = now if now is not None else time.time()
-    comment_attempts(ip, now).append(now)
+    with STATE_LOCK:
+        now = now if now is not None else time.time()
+        attempts = comment_attempts(ip, now)
+        attempts.append(now)
+        COMMENT_SUBMISSIONS[ip] = attempts
+        _trim_rate_store(COMMENT_SUBMISSIONS)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+    if current >= SCHEMA_VERSION:
+        return
+
+    for table, columns in REQUIRED_COLUMNS.items():
+        existing = _table_columns(conn, table)
+        for name, definition in columns.items():
+            if name not in existing:
+                safe_definition = definition.replace(" UNIQUE", "")
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {safe_definition}")
+
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_posts_status_published_at
+          ON posts(status, published_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_projects_status_updated_at
+          ON projects(status, updated_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_games_status_updated_at
+          ON games(status, updated_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_comments_post_created_at
+          ON comments(post_id, created_at DESC, id DESC);
+        """
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        (SCHEMA_VERSION, now_iso()),
+    )
+    conn.commit()
+
+
+def initialize_database(conn: sqlite3.Connection, *, seed_data: bool = False) -> None:
+    conn.executescript(SCHEMA)
+    migrate_schema(conn)
+    if seed_data:
+        seed(conn)
 
 
 def db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    database_is_new = not DB_PATH.exists() or DB_PATH.stat().st_size == 0
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    seed(conn)
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode = WAL")
+    initialize_database(conn, seed_data=database_is_new)
     return conn
+
+
+def readiness_check() -> bool:
+    conn: sqlite3.Connection | None = None
+    probe = DATA_DIR / ".readiness"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        probe.write_bytes(b"ok")
+        probe.unlink()
+        conn = db()
+        conn.execute("SELECT 1").fetchone()
+        return True
+    except (OSError, sqlite3.Error):
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def normalize_password(password: str) -> str:
@@ -272,6 +473,7 @@ def rotate_admin_password(conn: sqlite3.Connection, username: str, current_passw
         raise ValueError("当前密码不正确")
     conn.execute("UPDATE admins SET password_hash = ? WHERE id = ?", (password_hash(new_password), row["id"]))
     conn.commit()
+    revoke_admin_sessions(str(row["id"]))
 
 
 def seed(conn: sqlite3.Connection) -> None:
@@ -351,10 +553,31 @@ def validate_external_url(value: str) -> str:
     value = value.strip()
     if not value:
         return ""
+    if len(value) > MAX_URL_CHARS:
+        raise ValueError(f"外链不能超过 {MAX_URL_CHARS} 个字符")
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("外链必须使用 http 或 https")
     return value
+
+
+def validate_content_fields(kind: str, data: dict[str, str]) -> None:
+    rules = {
+        "posts": [("title", "标题", MAX_TITLE_CHARS, True), ("excerpt", "摘要", MAX_SUMMARY_CHARS, True), ("body", "正文", MAX_BODY_CHARS, False), ("tags", "标签", MAX_TAGS_CHARS, False), ("cover", "封面地址", MAX_URL_CHARS, False)],
+        "projects": [("name", "项目名称", MAX_TITLE_CHARS, True), ("summary", "项目简介", MAX_SUMMARY_CHARS, True), ("description", "项目说明", MAX_DESCRIPTION_CHARS, False), ("tech_stack", "技术栈", MAX_TAGS_CHARS, False)],
+        "games": [("name", "游戏名称", MAX_TITLE_CHARS, True), ("summary", "游戏简介", MAX_SUMMARY_CHARS, True), ("description", "游戏说明", MAX_DESCRIPTION_CHARS, False), ("controls", "操作方式", MAX_CONTROLS_CHARS, True)],
+    }
+    for field, label, limit, required in rules[kind]:
+        value = str(data.get(field, "")).strip()
+        if required and not value:
+            raise ValueError(f"{label}不能为空")
+        if len(value) > limit:
+            raise ValueError(f"{label}不能超过 {limit} 个字符")
+        data[field] = value
+    slug = str(data.get("slug", "")).strip()
+    if len(slug) > MAX_SLUG_CHARS:
+        raise ValueError(f"slug 不能超过 {MAX_SLUG_CHARS} 个字符")
+    data["slug"] = slug
 
 
 def next_published_at(previous_status: str, previous_published_at: str | None, new_status: str, timestamp: str) -> str | None:
@@ -463,11 +686,29 @@ def cookie_value(headers, key: str) -> str | None:
     return jar[key].value if key in jar else None
 
 
-def render_page(title: str, content: str, *, admin: bool = False, active: str = "") -> str:
+def parse_page(value: str | None) -> int:
+    try:
+        page = int(value or "1")
+    except ValueError:
+        return 1
+    return max(1, page)
+
+
+def pagination_nav(path: str, page: int, has_next: bool) -> str:
+    links = []
+    if page > 1:
+        links.append(f'<a class="button button-secondary" href="{path}?page={page - 1}">上一页</a>')
+    if has_next:
+        links.append(f'<a class="button button-secondary" href="{path}?page={page + 1}">下一页</a>')
+    return f'<nav class="pagination" aria-label="分页">{f"<span>第 {page} 页</span>" if links else ""}{"".join(links)}</nav>' if links else ""
+
+
+def render_page(title: str, content: str, *, admin: bool = False, active: str = "", csrf_token: str = "") -> str:
     if admin:
+        logout_csrf = f'<input type="hidden" name="csrf" value="{esc(csrf_token)}">' if csrf_token else ""
         nav = f"""
         <header class=\"admin-top\"><a class=\"brand brand-admin\" href=\"/admin\"><span class=\"brand-dot\"></span>个人工作台</a>
-        <div class=\"admin-top-actions\"><a class=\"quiet-link\" href=\"/admin/password\">修改密码</a><a class=\"quiet-link\" href=\"/\" target=\"_blank\">查看站点 ↗</a><form method=\"post\" action=\"/admin/logout\"><button class=\"button button-ghost\">退出</button></form></div></header>
+        <div class=\"admin-top-actions\"><a class=\"quiet-link\" href=\"/admin/password\">修改密码</a><a class=\"quiet-link\" href=\"/\" target=\"_blank\">查看站点 ↗</a><form method=\"post\" action=\"/admin/logout\">{logout_csrf}<button class=\"button button-ghost\">退出</button></form></div></header>
         <div class=\"admin-layout\"><aside class=\"admin-rail\"><p class=\"rail-label\">工作区</p>
         <a class=\"rail-link {"is-active" if active == "overview" else ""}\" href=\"/admin\">概览</a>
         <a class=\"rail-link {"is-active" if active == "posts" else ""}\" href=\"/admin/posts\">文章 <span>⌘</span></a>
@@ -552,23 +793,31 @@ def home(conn: sqlite3.Connection) -> str:
     <footer class=\"site-footer wrap\"><span>Signal Desk / 个人工作台</span><span>Built slowly, shipped often.</span></footer></main>""", active="")
 
 
-def listing(conn: sqlite3.Connection, kind: str) -> str:
+def listing(conn: sqlite3.Connection, kind: str, *, page: int = 1, page_size: int = PAGE_SIZE) -> str:
+    page = max(1, page)
+    page_size = min(MAX_PAGE_SIZE, max(1, page_size))
+    offset = (page - 1) * page_size
     if kind == "blog":
-        rows = conn.execute("SELECT * FROM posts WHERE status='published' ORDER BY published_at DESC, id DESC").fetchall()
-        cards = "".join(public_card("文章", r["title"], r["excerpt"], f"/blog/{quote(r['slug'])}", fmt_date(r["published_at"]), f'<div class="tag-line">{" ".join("#" + esc(t) for t in tags(r["tags"]))}</div>') for r in rows)
+        rows = conn.execute("SELECT * FROM posts WHERE status='published' ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?", (page_size + 1, offset)).fetchall()
         title, intro = "文章", "把正在思考的事情，写成可以被重新打开的页面。"
     elif kind == "projects":
-        rows = conn.execute("SELECT * FROM projects WHERE status != 'archived' ORDER BY featured DESC, updated_at DESC").fetchall()
-        cards = "".join(public_card("项目", r["name"], r["summary"], f"/projects/{quote(r['slug'])}", r["status"], f'<div class="tag-line">{" · ".join(esc(t) for t in tags(r["tech_stack"]))}</div>') for r in rows)
+        rows = conn.execute("SELECT * FROM projects WHERE status != 'archived' ORDER BY featured DESC, updated_at DESC, id DESC LIMIT ? OFFSET ?", (page_size + 1, offset)).fetchall()
         title, intro = "项目", "代码是想法留下的另一种形状。"
     else:
-        rows = conn.execute("SELECT * FROM games WHERE status='published' ORDER BY featured DESC, updated_at DESC").fetchall()
-        cards = "".join(public_card("游戏", r["name"], r["summary"], f"/games/{quote(r['slug'])}", "可玩", '<span class="play-mark">▶ 立即开始</span>') for r in rows)
+        rows = conn.execute("SELECT * FROM games WHERE status='published' ORDER BY featured DESC, updated_at DESC, id DESC LIMIT ? OFFSET ?", (page_size + 1, offset)).fetchall()
         title, intro = "游戏", "一些小而完整的实验，打开浏览器就能开始。"
+    has_next = len(rows) > page_size
+    rows = rows[:page_size]
+    if kind == "blog":
+        cards = "".join(public_card("文章", r["title"], r["excerpt"], f"/blog/{quote(r['slug'])}", fmt_date(r["published_at"]), f'<div class="tag-line">{" ".join("#" + esc(t) for t in tags(r["tags"]))}</div>') for r in rows)
+    elif kind == "projects":
+        cards = "".join(public_card("项目", r["name"], r["summary"], f"/projects/{quote(r['slug'])}", r["status"], f'<div class="tag-line">{" · ".join(esc(t) for t in tags(r["tech_stack"]))}</div>') for r in rows)
+    else:
+        cards = "".join(public_card("游戏", r["name"], r["summary"], f"/games/{quote(r['slug'])}", "可玩", '<span class="play-mark">▶ 立即开始</span>') for r in rows)
     timeline = article_timeline(rows) if kind == "blog" else ""
     visual = blog_gallery(conn) if kind == "blog" else ""
     intro_html = visual or f'<div class="subpage-intro"><p class="kicker">SIGNAL DESK / {kind.upper()}</p><h1>{title}</h1><p>{intro}</p></div>'
-    return render_page(title, f"""<main class=\"subpage wrap\">{intro_html}{timeline}<div class=\"card-grid card-grid-wide\">{cards or '<p class="empty-state">这里暂时是空的，稍后会更新。</p>'}</div></main><footer class=\"site-footer wrap\"><span>Signal Desk</span><span>Keep making.</span></footer>""", active=kind)
+    return render_page(title, f"""<main class=\"subpage wrap\">{intro_html}{timeline}<div class=\"card-grid card-grid-wide\">{cards or '<p class="empty-state">这里暂时是空的，稍后会更新。</p>'}</div>{pagination_nav('/' + kind, page, has_next)}</main><footer class=\"site-footer wrap\"><span>Signal Desk</span><span>Keep making.</span></footer>""", active=kind)
 
 
 def detail(conn: sqlite3.Connection, kind: str, slug: str) -> tuple[int, str]:
@@ -599,7 +848,7 @@ def admin_shell(conn: sqlite3.Connection) -> dict[str, object]:
     }
 
 
-def admin_dashboard(conn: sqlite3.Connection) -> str:
+def admin_dashboard(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> str:
     data = admin_shell(conn)
     post_count = len(data["posts"])
     project_count = len(data["projects"])
@@ -607,12 +856,16 @@ def admin_dashboard(conn: sqlite3.Connection) -> str:
     latest = list(data["posts"][:4])
     rows = "".join(f'<a class="activity-row" href="/admin/posts/edit?id={r["id"]}"><span>{esc(r["title"])}</span><span>{status_badge(r["status"])}</span><time>{fmt_date(r["updated_at"])}</time></a>' for r in latest)
     content = f"""<div class=\"admin-heading\"><div><p class=\"kicker\">WORKSPACE / OVERVIEW</p><h1>今天，先把一个想法发布出去。</h1><p>这里是你的内容控制台。文章、项目和游戏都从这里进入公开站点。</p></div><a class=\"button button-primary\" href=\"/admin/posts/new\">写新文章 <span>＋</span></a></div><section class=\"stat-strip\"><div><span>文章</span><strong>{post_count:02d}</strong><small>含草稿</small></div><div><span>项目</span><strong>{project_count:02d}</strong><small>持续维护</small></div><div><span>游戏</span><strong>{game_count:02d}</strong><small>可直接打开</small></div></section><section class=\"admin-section\"><div class=\"admin-section-head\"><div><p class=\"section-index\">最近活动</p><h2>文章编辑轨迹</h2></div><a class=\"quiet-link\" href=\"/admin/posts\">管理全部 ↗</a></div><div class=\"activity-list\">{rows or '<p class="empty-state">还没有文章，先写下第一篇。</p>'}</div></section><section class=\"quick-grid\"><a href=\"/admin/projects/new\"><span>↗</span><strong>添加项目</strong><small>放上 GitHub 链接</small></a><a href=\"/admin/games/new\"><span>▶</span><strong>添加游戏</strong><small>登记一个可玩的实验</small></a></section>"""
-    return render_page("后台概览", content, admin=True, active="overview")
+    return render_page("后台概览", content, admin=True, active="overview", csrf_token=str(handler.session().get("csrf", "")))
 
 
-def admin_list(conn: sqlite3.Connection, kind: str) -> str:
+def admin_list(conn: sqlite3.Connection, kind: str, handler: BaseHTTPRequestHandler, *, page: int = 1) -> str:
     table = {"posts": "posts", "projects": "projects", "games": "games"}[kind]
-    rows = conn.execute(f"SELECT * FROM {table} ORDER BY updated_at DESC, id DESC").fetchall()
+    page = max(1, page)
+    offset = (page - 1) * PAGE_SIZE
+    rows = conn.execute(f"SELECT * FROM {table} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", (PAGE_SIZE + 1, offset)).fetchall()
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
     if kind == "posts":
         title, action, label = "文章", "/admin/posts/new", "写新文章"
         row_html = "".join(f'<a class="manage-row" href="/admin/posts/edit?id={r["id"]}"><span class="manage-title">{esc(r["title"])}</span><span>{status_badge(r["status"])}</span><span class="manage-muted">{", ".join(tags(r["tags"]))}</span><time>{fmt_date(r["updated_at"])}</time><b>编辑 ↗</b></a>' for r in rows)
@@ -622,8 +875,8 @@ def admin_list(conn: sqlite3.Connection, kind: str) -> str:
     else:
         title, action, label = "游戏", "/admin/games/new", "添加游戏"
         row_html = "".join(f'<a class="manage-row" href="/admin/games/edit?id={r["id"]}"><span class="manage-title">{esc(r["name"])}</span><span>{status_badge(r["status"])}</span><span class="manage-muted">{esc(r["controls"])}</span><time>{fmt_date(r["updated_at"])}</time><b>编辑 ↗</b></a>' for r in rows)
-    content = f"""<div class=\"admin-heading\"><div><p class=\"kicker\">WORKSPACE / {kind.upper()}</p><h1>{title}</h1><p>保持内容清楚、状态可见，发布动作只保留一个重点。</p></div><a class=\"button button-primary\" href=\"{action}\">{label} <span>＋</span></a></div><section class=\"manage-table\"><div class=\"manage-head\"><span>名称</span><span>状态</span><span>附加信息</span><span>更新时间</span><span></span></div>{row_html or '<p class="empty-state">还没有内容。点击右上角开始添加。</p>'}</section>"""
-    return render_page(f"管理{title}", content, admin=True, active=kind)
+    content = f"""<div class=\"admin-heading\"><div><p class=\"kicker\">WORKSPACE / {kind.upper()}</p><h1>{title}</h1><p>保持内容清楚、状态可见，发布动作只保留一个重点。</p></div><a class=\"button button-primary\" href=\"{action}\">{label} <span>＋</span></a></div><section class=\"manage-table\"><div class=\"manage-head\"><span>名称</span><span>状态</span><span>附加信息</span><span>更新时间</span><span></span></div>{row_html or '<p class="empty-state">还没有内容。点击右上角开始添加。</p>'}</section>{pagination_nav('/admin/' + kind, page, has_next)}"""
+    return render_page(f"管理{title}", content, admin=True, active=kind, csrf_token=str(handler.session().get("csrf", "")))
 
 
 def admin_media(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> str:
@@ -636,11 +889,11 @@ def admin_media(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> st
         delete = f'<form method="post" action="/admin/media/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button type="submit">删除</button></form>'
         cards.append(f'<article class="media-card"><span class="media-card__order" aria-label="顺序 {index}">{index}</span><img src="/media/gallery/{quote(row["stored_name"])}" alt="{esc(row["original_name"])}"><strong>{esc(row["original_name"])}</strong>{controls}{delete}</article>')
     content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / MEDIA</p><h1>图库</h1><p>管理首页背景图片，最多保留 9 张。</p></div></div><form method="post" action="/admin/media/upload" enctype="multipart/form-data">{csrf_for(handler)}<input type="file" name="files" accept="image/jpeg,image/png,image/webp,image/gif" multiple required><button type="submit">上传图片</button></form><section class="media-grid">{"".join(cards) or "<p class=\"empty-state\">还没有图片。</p>"}</section><form method="post" action="/admin/media/settings">{csrf_for(handler)}{select_input("切换效果", "effect", effect, [("fade", "淡入淡出"), ("slide", "滑动"), ("zoom", "缩放")])}<button type="submit">保存效果</button></form>'
-    return render_page("图库", content, admin=True, active="media")
+    return render_page("图库", content, admin=True, active="media", csrf_token=str(handler.session().get("csrf", "")))
 
 
 def comment_section(conn: sqlite3.Connection, post_id: int, slug: str) -> str:
-    rows = conn.execute("SELECT * FROM comments WHERE post_id = ? AND visible = 1 ORDER BY created_at DESC, id DESC", (post_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM comments WHERE post_id = ? AND visible = 1 ORDER BY created_at DESC, id DESC LIMIT ?", (post_id, PUBLIC_COMMENT_LIMIT)).fetchall()
     cards = []
     for row in rows:
         reply = f'<div class="comment-reply"><strong>站长回复</strong><p>{esc(row["reply"])}</p></div>' if row["reply"] else ""
@@ -648,24 +901,28 @@ def comment_section(conn: sqlite3.Connection, post_id: int, slug: str) -> str:
     return f'''<section class="comments-section" aria-labelledby="comments-title"><div class="comments-head"><div><p class="kicker">OPEN NOTES</p><h2 id="comments-title">留下你的建议</h2></div><span>{len(rows)} 条留言</span></div><form class="comment-form" method="post" action="/blog/{quote(slug)}/comments"><label class="field"><span>留言内容</span><textarea name="content" rows="5" maxlength="{MAX_COMMENT_CHARS}" required placeholder="写下你的想法、问题或建议"></textarea></label><label class="comment-honeypot" aria-hidden="true">网站<input name="website" tabindex="-1" autocomplete="off"></label><button class="button button-primary" type="submit">发布留言 <span>↗</span></button></form><div class="comment-list">{"".join(cards) or '<p class="empty-state">还没有留言，欢迎留下第一条建议。</p>'}</div></section>'''
 
 
-def admin_comments(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler) -> str:
-    rows = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id ORDER BY comments.created_at DESC, comments.id DESC").fetchall()
+def admin_comments(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, *, page: int = 1) -> str:
+    page = max(1, page)
+    offset = (page - 1) * PAGE_SIZE
+    rows = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id ORDER BY comments.created_at DESC, comments.id DESC LIMIT ? OFFSET ?", (PAGE_SIZE + 1, offset)).fetchall()
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
     cards = []
     for row in rows:
         delete_form = f'''<form method="post" action="/admin/comments/delete">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><button class="button button-ghost" type="submit">删除</button></form>'''
         reply = f'<span class="admin-comment-row-reply">已回复：{esc(row["reply"])}</span>' if row["reply"] else '<span class="admin-comment-row-reply is-empty">待回复</span>'
         visibility = '<span class="admin-comment-row-status is-visible">公开</span>' if row["visible"] else '<span class="admin-comment-row-status">已隐藏</span>'
         cards.append(f'''<article class="admin-comment-row"><div class="admin-comment-row-main"><div class="admin-comment-row-title"><strong>{esc(row["post_title"])}</strong>{visibility}</div><p>{esc(row["content"])}</p><div class="admin-comment-row-submeta">{reply}</div></div><div class="admin-comment-row-meta"><span>{esc(row["ip_address"])}</span><time>{esc(fmt_datetime(row["created_at"]))}</time></div><div class="admin-comment-row-actions"><a class="button button-primary" href="/admin/comments/edit?id={row["id"]}">编辑 ↗</a>{delete_form}</div></article>''')
-    content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>按时间查看留言，编辑和删除操作位于每行末尾。</p></div></div><section class="admin-comments-list"><div class="admin-comments-table-head"><span>留言</span><span>来源</span><span>操作</span></div>{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>'
-    return render_page("留言管理", content, admin=True, active="comments")
+    content = f'<div class="admin-heading"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>留言管理</h1><p>按时间查看留言，编辑和删除操作位于每行末尾。</p></div></div><section class="admin-comments-list"><div class="admin-comments-table-head"><span>留言</span><span>来源</span><span>操作</span></div>{"".join(cards) or "<p class=\"empty-state\">还没有留言。</p>"}</section>{pagination_nav("/admin/comments", page, has_next)}'
+    return render_page("留言管理", content, admin=True, active="comments", csrf_token=str(handler.session().get("csrf", "")))
 
 
 def admin_comment_edit(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, comment_id: int) -> str:
     row = conn.execute("SELECT comments.*, posts.title AS post_title FROM comments JOIN posts ON posts.id = comments.post_id WHERE comments.id = ?", (comment_id,)).fetchone()
     if not row:
-        return render_page("找不到留言", '<main class="subpage wrap"><div class="empty-state large"><p>这条留言已经不存在。</p><a class="button button-primary" href="/admin/comments">返回留言管理</a></div></main>', admin=True, active="comments")
+        return render_page("找不到留言", '<main class="subpage wrap"><div class="empty-state large"><p>这条留言已经不存在。</p><a class="button button-primary" href="/admin/comments">返回留言管理</a></div></main>', admin=True, active="comments", csrf_token=str(handler.session().get("csrf", "")))
     content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / COMMENTS</p><h1>编辑留言</h1><p>{esc(row["post_title"])} · {esc(row["ip_address"])} · {esc(fmt_datetime(row["created_at"]))}</p></div><a class="quiet-link" href="/admin/comments">← 返回留言列表</a></div><form class="admin-comment-edit-form" method="post" action="/admin/comments/save">{csrf_for(handler)}<input type="hidden" name="id" value="{row["id"]}"><label class="field"><span>访客留言</span><textarea name="content" rows="8" maxlength="{MAX_COMMENT_CHARS}" required>{esc(row["content"])}</textarea></label><label class="field"><span>站长回复</span><textarea name="reply" rows="6" maxlength="{MAX_COMMENT_CHARS}" placeholder="可选：回复会显示在文章页">{esc(row["reply"])}</textarea></label><div class="admin-comment-edit-footer"><label class="check-field"><input type="checkbox" name="visible" {"checked" if row["visible"] else ""}><span>在文章页显示</span></label><button class="button button-primary" type="submit">保存修改 <span>↗</span></button></div></form>'''
-    return render_page("编辑留言", content, admin=True, active="comments")
+    return render_page("编辑留言", content, admin=True, active="comments", csrf_token=str(handler.session().get("csrf", "")))
 
 
 def form_input(label: str, name: str, value: str = "", *, required: bool = False, placeholder: str = "", textarea: bool = False, rows: int = 8, input_type: str = "text") -> str:
@@ -703,7 +960,7 @@ def edit_form(conn: sqlite3.Connection, handler: BaseHTTPRequestHandler, kind: s
         fields = form_input("游戏名称", "name", row["name"], required=True, placeholder="例如：Signal Runner") + form_input("Slug", "slug", row["slug"], placeholder="必须对应 games/<slug>/index.html") + form_input("一句话简介", "summary", row["summary"], required=True, placeholder="玩家打开前看到的介绍") + form_input("详细说明", "description", row["description"], textarea=True, rows=10, placeholder="玩法、灵感和目标。") + form_input("操作方式", "controls", row["controls"], required=True, placeholder="方向键移动，R 重开") + form_input("源码地址（可选）", "source_url", row["source_url"], placeholder="https://github.com/...") + select_input("发布状态", "status", row["status"], [("published", "已发布"), ("draft", "草稿")]) + f'<label class="check-field"><input type="checkbox" name="featured" {"checked" if row["featured"] else ""}><span>在首页精选</span></label>'
         hint = "将游戏文件放到 games/<slug>/index.html 后，公开页会自动提供运行入口。"
     action = f"/admin/{kind}/save"
-    return render_page(f"{'编辑' if not is_new else '新建'}{prefix}", f"""<div class=\"admin-heading compact\"><div><p class=\"kicker\">WORKSPACE / {kind.upper()}</p><h1>{'编辑' if not is_new else '新建'}{prefix}</h1><p>{hint}</p></div><a class=\"quiet-link\" href=\"/admin/{kind}\">← 返回列表</a></div><form class=\"editor-form\" method=\"post\" action=\"{action}\">{csrf_for(handler)}{f'<input type="hidden" name="id" value="{row["id"]}">' if not is_new else ''}<div class=\"form-main\">{fields}</div><aside class=\"form-aside\"><div class=\"save-card\"><p>发布动作</p><strong>{'更新已有内容' if not is_new else '保存为草稿'}</strong><button class=\"button button-primary button-wide\" type=\"submit\">保存{prefix} <span>↗</span></button><p class=\"form-help\">保存后可在公开站点检查结果。</p></div></aside></form>""", admin=True, active=kind)
+    return render_page(f"{'编辑' if not is_new else '新建'}{prefix}", f"""<div class=\"admin-heading compact\"><div><p class=\"kicker\">WORKSPACE / {kind.upper()}</p><h1>{'编辑' if not is_new else '新建'}{prefix}</h1><p>{hint}</p></div><a class=\"quiet-link\" href=\"/admin/{kind}\">← 返回列表</a></div><form class=\"editor-form\" method=\"post\" action=\"{action}\">{csrf_for(handler)}{f'<input type="hidden" name="id" value="{row["id"]}">' if not is_new else ''}<div class=\"form-main\">{fields}</div><aside class=\"form-aside\"><div class=\"save-card\"><p>发布动作</p><strong>{'更新已有内容' if not is_new else '保存为草稿'}</strong><button class=\"button button-primary button-wide\" type=\"submit\">保存{prefix} <span>↗</span></button><p class=\"form-help\">保存后可在公开站点检查结果。</p></div></aside></form>""", admin=True, active=kind, csrf_token=str(handler.session().get("csrf", "")))
 
 
 def parse_multipart_form(body: bytes, content_type: str) -> tuple[dict[str, str], list[dict[str, object]]]:
@@ -726,10 +983,24 @@ def parse_multipart_form(body: bytes, content_type: str) -> tuple[dict[str, str]
 
 
 def parse_form_data(data: str, length: int) -> dict[str, str]:
+    if length < 0:
+        raise ValueError("请求长度无效")
     if length > MAX_BODY_BYTES:
         raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
     parsed = parse_qs(data, keep_blank_values=True)
     return {key: values[-1] for key, values in parsed.items()}
+
+
+def parse_content_length(value: str | None) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        length = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("请求长度无效") from exc
+    if length < 0:
+        raise ValueError("请求长度无效")
+    return length
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -738,10 +1009,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[{self.log_date_time_string()}] {fmt % args}")
 
-    def session(self) -> dict[str, str]:
+    def session(self) -> dict[str, object]:
         raw_token = cookie_value(self.headers, "signal_session")
         token = verify_session_cookie(raw_token) if raw_token else None
-        return SESSIONS.get(token, {}) if token else {}
+        if not token:
+            return {}
+        with STATE_LOCK:
+            session = SESSIONS.get(token)
+            if not session:
+                return {}
+            now = time.time()
+            try:
+                last_seen = float(session.get("last_seen", now))
+                created_at = float(session.get("created_at", last_seen))
+            except (TypeError, ValueError):
+                SESSIONS.pop(token, None)
+                return {}
+            if now - last_seen > SESSION_TTL_SECONDS or now - created_at > SESSION_TTL_SECONDS:
+                SESSIONS.pop(token, None)
+                return {}
+            session["created_at"] = created_at
+            session["last_seen"] = now
+            return session
 
     def is_admin(self) -> bool:
         return bool(self.session().get("admin_id"))
@@ -752,6 +1041,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+        self.send_header("Referrer-Policy", "same-origin")
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
@@ -776,17 +1068,25 @@ class Handler(BaseHTTPRequestHandler):
         if not path.exists() or not path.is_file():
             self.send_error(404)
             return
-        content = path.read_bytes()
+        size = path.stat().st_size
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Length", str(size))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        csp = "default-src 'self'; frame-ancestors 'none'"
+        if root is not None and root.resolve() == (ROOT / "games").resolve():
+            csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+        self.send_header("Content-Security-Policy", csp)
+        self.send_header("Referrer-Policy", "same-origin")
         if root is not None and root.resolve() == (ROOT / "static").resolve():
             self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
-        self.wfile.write(content)
+        with path.open("rb") as stream:
+            while chunk := stream.read(FILE_CHUNK_BYTES):
+                self.wfile.write(chunk)
 
     def parse_form(self) -> dict[str, str]:
-        length = int(self.headers.get("Content-Length", "0"))
+        length = parse_content_length(self.headers.get("Content-Length"))
         if length > MAX_BODY_BYTES:
             raise RequestTooLarge(f"request body exceeds {MAX_BODY_BYTES} bytes")
         data = self.rfile.read(length).decode("utf-8") if length else ""
@@ -823,11 +1123,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 self.send_html(home(conn)); return
             if path == "/blog":
-                self.send_html(listing(conn, "blog")); return
+                query = parse_qs(urlparse(self.path).query)
+                self.send_html(listing(conn, "blog", page=parse_page(query.get("page", ["1"])[0]))); return
             if path == "/projects":
-                self.send_html(listing(conn, "projects")); return
+                query = parse_qs(urlparse(self.path).query)
+                self.send_html(listing(conn, "projects", page=parse_page(query.get("page", ["1"])[0]))); return
             if path == "/games":
-                self.send_html(listing(conn, "games")); return
+                query = parse_qs(urlparse(self.path).query)
+                self.send_html(listing(conn, "games", page=parse_page(query.get("page", ["1"])[0]))); return
             if path == "/about":
                 self.send_html(about()); return
             for kind in ("blog", "projects", "games"):
@@ -841,14 +1144,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(render_page("登录后台", """<main class="login-page"><div class="login-card"><p class="kicker">SIGNAL DESK / ADMIN</p><h1>回到工作台。</h1><p>单管理员入口。发布内容之前，先确认这是你。</p><form method="post" action="/admin/login"><label class="field"><span>用户名</span><input name="username" autocomplete="username" required value="admin"></label><label class="field"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label><button class="button button-primary button-wide" type="submit">登录后台 ↗</button></form><p class="login-help">密码由部署环境变量 ADMIN_PASSWORD 提供。</p></div></main>""")); return
             if path == "/admin/password":
                 if not self.is_admin(): self.redirect("/admin/login"); return
-                content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / SECURITY</p><h1>修改密码</h1><p>修改后，当前登录会话仍然有效。</p></div><a class="quiet-link" href="/admin">← 返回后台</a></div><form class="editor-form" method="post" action="/admin/password">{csrf_for(self)}<div class="form-main">{form_input("当前密码", "current_password", textarea=False, input_type="password")}{form_input("新密码", "new_password", textarea=False, input_type="password")}{form_input("确认新密码", "confirm_password", textarea=False, input_type="password")}</div><aside class="form-aside"><div class="save-card"><p>安全设置</p><strong>至少 12 个字符</strong><button class="button button-primary button-wide" type="submit">更新密码 ↗</button></div></aside></form>'''
-                self.send_html(render_page("修改密码", content, admin=True, active="overview")); return
+                content = f'''<div class="admin-heading compact"><div><p class="kicker">WORKSPACE / SECURITY</p><h1>修改密码</h1><p>修改后，所有后台会话都会失效，需要重新登录。</p></div><a class="quiet-link" href="/admin">← 返回后台</a></div><form class="editor-form" method="post" action="/admin/password">{csrf_for(self)}<div class="form-main">{form_input("当前密码", "current_password", textarea=False, input_type="password")}{form_input("新密码", "new_password", textarea=False, input_type="password")}{form_input("确认新密码", "confirm_password", textarea=False, input_type="password")}</div><aside class="form-aside"><div class="save-card"><p>安全设置</p><strong>至少 12 个字符</strong><button class="button button-primary button-wide" type="submit">更新密码 ↗</button></div></aside></form>'''
+                self.send_html(render_page("修改密码", content, admin=True, active="overview", csrf_token=str(self.session().get("csrf", "")))); return
             if path == "/admin/media":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 self.send_html(admin_media(conn, self)); return
             if path == "/admin/comments":
                 if not self.is_admin(): self.redirect("/admin/login"); return
-                self.send_html(admin_comments(conn, self)); return
+                query = parse_qs(urlparse(self.path).query)
+                self.send_html(admin_comments(conn, self, page=parse_page(query.get("page", ["1"])[0]))); return
             if path == "/admin/comments/edit":
                 if not self.is_admin(): self.redirect("/admin/login"); return
                 query = parse_qs(urlparse(self.path).query)
@@ -859,10 +1163,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(admin_comment_edit(conn, self, comment_id)); return
             if path == "/admin" or path == "/admin/":
                 if not self.is_admin(): self.redirect("/admin/login"); return
-                self.send_html(admin_dashboard(conn)); return
+                self.send_html(admin_dashboard(conn, self)); return
             if path in ("/admin/posts", "/admin/projects", "/admin/games"):
                 if not self.is_admin(): self.redirect("/admin/login"); return
-                self.send_html(admin_list(conn, path.split("/")[-1])); return
+                query = parse_qs(urlparse(self.path).query)
+                self.send_html(admin_list(conn, path.split("/")[-1], self, page=parse_page(query.get("page", ["1"])[0]))); return
             m = re.match(r"^/admin/(posts|projects|games)/(new|edit)$", path)
             if m:
                 if not self.is_admin(): self.redirect("/admin/login"); return
@@ -874,7 +1179,7 @@ class Handler(BaseHTTPRequestHandler):
                     table = {"posts": "posts", "projects": "projects", "games": "games"}[kind]
                     row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
                     if not row:
-                        self.send_html(render_page("找不到内容", '<main class="subpage wrap"><div class="empty-state large"><p>这条内容已经不存在。</p></div></main>', admin=True), 404); return
+                        self.send_html(render_page("找不到内容", '<main class="subpage wrap"><div class="empty-state large"><p>这条内容已经不存在。</p></div></main>', admin=True, csrf_token=str(self.session().get("csrf", ""))), 404); return
                 self.send_html(edit_form(conn, self, kind, row)); return
             self.send_error(404)
         finally:
@@ -886,12 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             content_type = self.headers.get("Content-Type", "")
             if content_type.lower().startswith("multipart/form-data"):
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                except (TypeError, ValueError):
-                    raise ValueError("请求长度无效")
-                if length < 0:
-                    raise ValueError("请求长度无效")
+                length = parse_content_length(self.headers.get("Content-Length"))
                 if length > MAX_MULTIPART_BODY_BYTES:
                     raise RequestTooLarge(f"request body exceeds {MAX_MULTIPART_BODY_BYTES} bytes")
                 form, files = parse_multipart_form(self.rfile.read(length), content_type)
@@ -903,7 +1203,12 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_html(f'<main class="subpage wrap"><div class="empty-state large"><p>{esc(exc)}</p></div></main>', 400)
             return
-        conn = db()
+        try:
+            conn = db()
+        except sqlite3.OperationalError as exc:
+            print(f"[database-error] initialization failed: {exc}")
+            self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>数据库暂时不可用，请稍后重试。</p></div></main>', 503)
+            return
         client_ip = self.client_address[0]
         try:
             if path == "/admin/login":
@@ -914,17 +1219,27 @@ class Handler(BaseHTTPRequestHandler):
                 if row and password_matches(form.get("password", ""), row["password_hash"]):
                     clear_login_failures(client_ip)
                     token = secrets.token_urlsafe(32)
-                    SESSIONS[token] = {"admin_id": str(row["id"]), "csrf": secrets.token_urlsafe(24)}
+                    timestamp = time.time()
+                    with STATE_LOCK:
+                        SESSIONS[token] = {"admin_id": str(row["id"]), "csrf": secrets.token_urlsafe(24), "created_at": timestamp, "last_seen": timestamp}
                     self.redirect("/admin", cookie=build_session_cookie(token))
                 else:
                     record_login_failure(client_ip)
                     self.send_html(render_page("登录失败", """<main class="login-page"><div class="login-card"><p class="kicker">SIGNAL DESK / ADMIN</p><h1>密码不对。</h1><p class="error-copy">请重新输入管理员账号和密码。</p><a class="button button-primary button-wide" href="/admin/login">返回登录</a></div></main>"""), 401)
                 return
             if path == "/admin/logout":
+                if not self.is_admin():
+                    self.redirect("/admin/login")
+                    return
+                session = self.session()
+                if form.get("csrf") != session.get("csrf"):
+                    self.send_html(render_page("请求失效", '<main class="subpage wrap"><div class="empty-state large"><p>退出请求已失效，请从后台重新操作。</p></div></main>', admin=True, csrf_token=str(session.get("csrf", ""))), 403)
+                    return
                 raw_token = cookie_value(self.headers, "signal_session")
                 token = verify_session_cookie(raw_token) if raw_token else None
                 if token:
-                    SESSIONS.pop(token, None)
+                    with STATE_LOCK:
+                        SESSIONS.pop(token, None)
                 self.redirect("/", cookie=clear_session_cookie())
                 return
             comment_match = re.match(r"^/blog/([^/]+)/comments$", path)
@@ -953,7 +1268,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.is_admin():
                 self.redirect("/admin/login"); return
             if form.get("csrf") != self.session().get("csrf"):
-                self.send_html(render_page("请求失效", '<main class="subpage wrap"><div class="empty-state large"><p>编辑会话已失效，请返回后台重试。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 403); return
+                self.send_html(render_page("请求失效", '<main class="subpage wrap"><div class="empty-state large"><p>编辑会话已失效，请返回后台重试。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True, csrf_token=str(self.session().get("csrf", ""))), 403); return
             if path == "/admin/comments/save":
                 comment_id = int(form.get("id", "0"))
                 content = form.get("content", "").strip()
@@ -980,10 +1295,29 @@ class Handler(BaseHTTPRequestHandler):
                     suffix, mime = validate_gallery_upload(filename, str(item.get("content_type") or ""), payload)
                     checked.append((filename, payload, suffix, mime))
                 order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM site_images").fetchone()[0]
-                for filename, payload, suffix, mime in checked:
-                    stored = secrets.token_hex(16) + suffix; (gallery_dir() / stored).write_bytes(payload)
-                    conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)", (stored, filename, mime, len(payload), order, now_iso())); order += 1
-                conn.commit(); self.redirect("/admin/media"); return
+                created_files: list[Path] = []
+                temporary_files: list[Path] = []
+                try:
+                    for filename, payload, suffix, mime in checked:
+                        stored = secrets.token_hex(16) + suffix
+                        target = gallery_dir() / stored
+                        temporary = gallery_dir() / f".{stored}.tmp"
+                        temporary.write_bytes(payload)
+                        temporary_files.append(temporary)
+                        temporary.replace(target)
+                        created_files.append(target)
+                        conn.execute("INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)", (stored, filename, mime, len(payload), order, now_iso()))
+                        order += 1
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    for candidate in [*temporary_files, *created_files]:
+                        try:
+                            candidate.unlink()
+                        except FileNotFoundError:
+                            pass
+                    raise
+                self.redirect("/admin/media"); return
             if path == "/admin/media/update":
                 row_id = int(form.get("id", "0")); row = conn.execute("SELECT * FROM site_images WHERE id=?", (row_id,)).fetchone()
                 if not row: raise ValueError("图片不存在")
@@ -996,8 +1330,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/media/delete":
                 row_id = int(form.get("id", "0")); row = conn.execute("SELECT stored_name FROM site_images WHERE id=?", (row_id,)).fetchone()
                 if not row: raise ValueError("图片不存在")
-                conn.execute("DELETE FROM site_images WHERE id=?", (row_id,)); conn.commit(); target = gallery_dir() / row["stored_name"]
-                if target.exists(): target.unlink()
+                target = gallery_dir() / row["stored_name"]
+                recovery_file = gallery_dir() / f".{target.name}.{secrets.token_hex(8)}.deleting"
+                moved_to_recovery = False
+                try:
+                    if target.exists():
+                        target.replace(recovery_file)
+                        moved_to_recovery = True
+                    conn.execute("DELETE FROM site_images WHERE id=?", (row_id,))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    if moved_to_recovery and recovery_file.exists():
+                        recovery_file.replace(target)
+                    raise
+                if moved_to_recovery:
+                    try:
+                        remove_gallery_file(recovery_file)
+                    except OSError as exc:
+                        print(f"[media-cleanup] failed to remove {recovery_file.name}: {exc}")
                 self.redirect("/admin/media"); return
             if path == "/admin/media/settings":
                 effect = form.get("effect", "fade")
@@ -1016,12 +1367,14 @@ class Handler(BaseHTTPRequestHandler):
                 data = dict(form)
                 data["slug"] = data.get("slug") or slugify(data.get("title") or data.get("name") or "entry")
                 data["featured"] = 1 if form.get("featured") == "on" else 0
+                validate_content_fields(kind, data)
                 timestamp = now_iso()
                 if kind == "posts":
                     status = data.get("status", "draft")
                     if status not in {"draft", "published"}:
                         raise ValueError("文章状态无效")
                     data["slug"] = validate_slug(data["slug"])
+                    data["cover"] = validate_external_url(data.get("cover", ""))
                     columns = ["title", "slug", "excerpt", "body", "tags", "cover", "status"]
                     if form.get("id"):
                         existing = conn.execute("SELECT status, published_at FROM posts WHERE id = ?", (form["id"],)).fetchone()
@@ -1060,9 +1413,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_error(404)
         except ValueError as exc:
-            self.send_html(render_page("保存失败", f'<main class="subpage wrap"><div class="empty-state large"><p>{esc(exc)}</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 400)
-        except sqlite3.IntegrityError:
-            self.send_html(render_page("保存失败", '<main class="subpage wrap"><div class="empty-state large"><p>保存失败：slug 可能已经被使用。</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True), 409)
+            self.send_html(render_page("保存失败", f'<main class="subpage wrap"><div class="empty-state large"><p>{esc(exc)}</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True, csrf_token=str(self.session().get("csrf", ""))), 400)
+        except sqlite3.IntegrityError as exc:
+            message = "保存失败：slug 可能已经被使用。"
+            if "unique constraint failed" not in str(exc).lower() or ".slug" not in str(exc).lower():
+                print(f"[database-error] integrity error: {exc}")
+                message = "保存失败：数据约束不满足，请检查输入。"
+            self.send_html(render_page("保存失败", f'<main class="subpage wrap"><div class="empty-state large"><p>{message}</p><a class="button button-primary" href="/admin">回到后台</a></div></main>', admin=True, csrf_token=str(self.session().get("csrf", ""))), 409)
+        except sqlite3.OperationalError as exc:
+            print(f"[database-error] write failed: {exc}")
+            self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>数据库暂时不可用，请稍后重试。</p></div></main>', 503)
+        except OSError as exc:
+            print(f"[storage-error] write failed: {exc}")
+            self.send_html('<main class="subpage wrap"><div class="empty-state large"><p>文件暂时不可用，请稍后重试。</p></div></main>', 503)
         finally:
             conn.close()
 

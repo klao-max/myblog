@@ -1,10 +1,13 @@
 import io
 import os
+import sqlite3
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 os.environ.setdefault("APP_ENV", "development")
@@ -57,6 +60,9 @@ class SignalDeskTests(unittest.TestCase):
         conn.execute("DELETE FROM site_gallery_settings")
         conn.execute("DELETE FROM comments")
         conn.commit()
+        for path in app.gallery_dir().iterdir():
+            if path.is_file():
+                path.unlink()
         self.conn = conn
 
     def tearDown(self):
@@ -78,6 +84,32 @@ class SignalDeskTests(unittest.TestCase):
         self.assertEqual(app.verify_session_cookie(signed), token)
         self.assertIsNone(app.verify_session_cookie(signed + "x"))
         self.assertIn("Secure", cookie)
+
+    def test_expired_session_is_rejected(self):
+        token = "expired-session"
+        app.SESSIONS[token] = {
+            "admin_id": "1",
+            "csrf": "csrf",
+            "created_at": time.time() - app.SESSION_TTL_SECONDS - 1,
+            "last_seen": time.time() - app.SESSION_TTL_SECONDS - 1,
+        }
+        handler = make_handler("/admin", b"", {"Cookie": app.build_session_cookie(token)})
+
+        self.assertEqual(handler.session(), {})
+        self.assertNotIn(token, app.SESSIONS)
+
+    def test_password_rotation_revokes_existing_sessions(self):
+        self.conn.execute(
+            "UPDATE admins SET password_hash = ? WHERE username = 'admin'",
+            (app.password_hash("test-password"),),
+        )
+        self.conn.commit()
+        token = "password-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "csrf"}
+
+        app.rotate_admin_password(self.conn, "admin", "test-password", "new-password-123")
+
+        self.assertNotIn(token, app.SESSIONS)
 
     def test_external_urls_require_http_or_https(self):
         self.assertEqual(app.validate_external_url("https://example.com/a"), "https://example.com/a")
@@ -114,11 +146,43 @@ class SignalDeskTests(unittest.TestCase):
         with self.assertRaises(app.RequestTooLarge):
             app.parse_form_data("x" * (app.MAX_BODY_BYTES + 1), app.MAX_BODY_BYTES + 1)
 
+    def test_negative_content_length_is_rejected(self):
+        handler = make_handler(
+            "/admin/login",
+            b"username=admin&password=test-password",
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": "-1",
+            },
+        )
+
+        app.Handler.do_POST(handler)
+
+        self.assertIn("400 Bad Request", handler.wfile.getvalue().decode("latin-1"))
+
+    def test_non_numeric_content_length_is_rejected(self):
+        handler = make_handler(
+            "/admin/login",
+            b"username=admin&password=test-password",
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": "invalid",
+            },
+        )
+
+        app.Handler.do_POST(handler)
+
+        self.assertIn("400 Bad Request", handler.wfile.getvalue().decode("latin-1"))
+
     def test_gallery_rejects_unsupported_type_and_oversized_file(self):
         with self.assertRaises(ValueError):
             app.validate_gallery_upload("script.svg", "image/svg+xml", b"svg")
         with self.assertRaises(ValueError):
             app.validate_gallery_upload("large.jpg", "image/jpeg", b"x" * (app.MAX_MEDIA_BYTES + 1))
+
+    def test_gallery_rejects_payload_with_wrong_signature(self):
+        with self.assertRaises(ValueError):
+            app.validate_gallery_upload("fake.jpg", "image/jpeg", b"<html>not an image</html>")
 
     def test_gallery_images_are_ordered_and_filter_disabled_rows(self):
         now = app.now_iso()
@@ -195,10 +259,71 @@ class SignalDeskTests(unittest.TestCase):
         stored = next(app.gallery_dir().glob("*"))
         self.assertTrue(stored.is_file())
 
+    def test_gallery_upload_removes_file_when_database_commit_fails(self):
+        token = "gallery-session-failure"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body, content_type = self._multipart([("files", "failed.jpg", "image/jpeg", b"\xff\xd8fake-jpeg")])
+        handler = make_handler(
+            "/admin/media/upload",
+            body,
+            {
+                "Content-Type": content_type,
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+        real_connection = app.db()
+
+        class CommitFailureConnection:
+            def __getattr__(self, name):
+                return getattr(real_connection, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("forced commit failure")
+
+        with patch.object(app, "db", return_value=CommitFailureConnection()):
+            app.Handler.do_POST(handler)
+
+        self.assertIn("503 Service Unavailable", handler.wfile.getvalue().decode("latin-1"))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM site_images").fetchone()[0], 0)
+        self.assertEqual(list(app.gallery_dir().iterdir()), [])
+        real_connection.close()
+
+    def test_gallery_delete_keeps_recovery_file_when_unlink_fails(self):
+        token = "gallery-delete-unlink-failure"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        stored_name = "delete-me.jpg"
+        now = app.now_iso()
+        self.conn.execute(
+            "INSERT INTO site_images(stored_name, original_name, mime_type, size, sort_order, enabled, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (stored_name, stored_name, "image/jpeg", 4, 1, now),
+        )
+        self.conn.commit()
+        target = app.gallery_dir() / stored_name
+        target.write_bytes(b"data")
+        row_id = self.conn.execute("SELECT id FROM site_images WHERE stored_name = ?", (stored_name,)).fetchone()[0]
+        body = urlencode({"csrf": "integration-csrf", "id": str(row_id)}).encode()
+        handler = make_handler(
+            "/admin/media/delete",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+        with patch.object(app, "remove_gallery_file", side_effect=OSError("forced unlink failure")):
+            app.Handler.do_POST(handler)
+
+        self.assertIn("303 See Other", handler.wfile.getvalue().decode("latin-1"))
+        self.assertIsNone(self.conn.execute("SELECT id FROM site_images WHERE id = ?", (row_id,)).fetchone())
+        self.assertFalse(target.exists())
+        self.assertEqual(len(list(app.gallery_dir().glob("*.deleting"))), 1)
+
     def test_gallery_upload_accepts_multipart_body_over_form_limit(self):
         token = "gallery-session-large"
         app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
-        body, content_type = self._multipart([("files", "large.jpg", "image/jpeg", b"x" * (app.MAX_BODY_BYTES + 1))])
+        body, content_type = self._multipart([("files", "large.jpg", "image/jpeg", b"\xff\xd8" + b"x" * (app.MAX_BODY_BYTES - 1))])
         handler = make_handler("/admin/media/upload", body, {"Content-Type": content_type, "Content-Length": str(len(body)), "Cookie": app.build_session_cookie(token)})
         app.Handler.do_POST(handler)
         self.assertIn("303 See Other", handler.wfile.getvalue().decode("latin-1"))
@@ -278,6 +403,14 @@ class SignalDeskTests(unittest.TestCase):
         self.assertFalse(app.is_login_rate_limited("127.0.0.2", 10.0))
         self.assertFalse(app.is_login_rate_limited("127.0.0.1", app.LOGIN_WINDOW_SECONDS + 1))
 
+    def test_rate_limit_state_has_an_entry_bound(self):
+        app.COMMENT_SUBMISSIONS.clear()
+
+        for index in range(app.MAX_RATE_ENTRIES + 1):
+            app.record_comment_submission(f"198.51.100.{index}", now=100.0)
+
+        self.assertLessEqual(len(app.COMMENT_SUBMISSIONS), app.MAX_RATE_ENTRIES)
+
     def test_seed_and_markdown_basics(self):
         self.conn.execute(
             "INSERT INTO posts(title, slug, excerpt, body, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -310,6 +443,26 @@ class SignalDeskTests(unittest.TestCase):
         self.assertIn('</a><time class="timeline-date"', timeline_html)
         self.assertIn("The latest excerpt", timeline_html)
         self.assertLess(timeline_html.index("Newest note"), timeline_html.index("Older note"))
+
+    def test_blog_listing_is_paginated(self):
+        self.conn.execute("DELETE FROM posts")
+        now = app.now_iso()
+        self.conn.executemany(
+            "INSERT INTO posts(title, slug, excerpt, body, tags, status, published_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (f"Page {index}", f"page-{index}", "Excerpt", "Body", "", "published", now, now, now)
+                for index in range(app.PAGE_SIZE + 1)
+            ],
+        )
+        self.conn.commit()
+
+        first_page = app.listing(self.conn, "blog", page=1)
+        second_page = app.listing(self.conn, "blog", page=2)
+
+        self.assertEqual(sum(f"Page {index}" in first_page for index in range(app.PAGE_SIZE + 1)), app.PAGE_SIZE)
+        self.assertEqual(sum(f"Page {index}" in second_page for index in range(app.PAGE_SIZE + 1)), 1)
+        self.assertIn("下一页", first_page)
+        self.assertIn("上一页", second_page)
 
     def test_public_comment_is_saved_with_ip_and_visible(self):
         now = app.now_iso()
@@ -383,6 +536,107 @@ class SignalDeskTests(unittest.TestCase):
 
         self.assertEqual(headers["Cache-Control"], "public, max-age=3600")
 
+    def test_file_responses_are_streamed_in_chunks(self):
+        path = self.data_dir / "chunk-test.bin"
+        payload = b"x" * (app.FILE_CHUNK_BYTES * 2 + 1)
+        path.write_bytes(payload)
+        handler = app.Handler.__new__(app.Handler)
+        headers = {}
+        handler.send_response = lambda status: None
+        handler.send_header = lambda name, value: headers.__setitem__(name, value)
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
+            handler.serve_file(path)
+
+        self.assertEqual(headers["Content-Length"], str(len(payload)))
+        self.assertEqual(handler.wfile.getvalue(), payload)
+
+    def test_readiness_checks_data_directory(self):
+        self.assertTrue(app.readiness_check())
+        blocked = self.data_dir / "not-a-directory"
+        blocked.write_text("file")
+
+        with patch.object(app, "DATA_DIR", blocked):
+            self.assertFalse(app.readiness_check())
+
+    def test_response_security_headers_are_present(self):
+        handler = app.Handler.__new__(app.Handler)
+        headers = {}
+        handler.send_response = lambda status: None
+        handler.send_header = lambda name, value: headers.__setitem__(name, value)
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+
+        handler.send_html("<p>test</p>")
+
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertEqual(headers["Referrer-Policy"], "same-origin")
+
+        file_headers = {}
+        handler.send_response = lambda status: None
+        handler.send_header = lambda name, value: file_headers.__setitem__(name, value)
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+        handler.serve_file(Path(app.ROOT) / "static" / "style.css", Path(app.ROOT) / "static")
+
+        self.assertEqual(file_headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("frame-ancestors 'none'", file_headers["Content-Security-Policy"])
+        self.assertEqual(file_headers["Referrer-Policy"], "same-origin")
+
+    def test_empty_content_tables_are_not_reseeded(self):
+        self.conn.close()
+        reopened = app.db()
+        try:
+            counts = {
+                table: reopened.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("posts", "projects", "games")
+            }
+        finally:
+            reopened.close()
+
+        self.assertEqual(counts, {"posts": 0, "projects": 0, "games": 0})
+
+    def test_legacy_schema_gets_missing_columns(self):
+        legacy = __import__("sqlite3").connect(":memory:")
+        legacy.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT, slug TEXT)")
+
+        app.initialize_database(legacy)
+
+        columns = {row[1] for row in legacy.execute("PRAGMA table_info(posts)").fetchall()}
+        self.assertIn("excerpt", columns)
+        self.assertIn("updated_at", columns)
+        self.assertEqual(legacy.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], app.SCHEMA_VERSION)
+        legacy.close()
+
+    def test_sqlite_uses_wal_journal_mode(self):
+        self.assertEqual(self.conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+
+    def test_database_lock_returns_service_unavailable(self):
+        class LockedConnection:
+            def execute(self, *_args):
+                raise __import__("sqlite3").OperationalError("database is locked")
+
+            def close(self):
+                return None
+
+        body = urlencode({"username": "admin", "password": "test-password"}).encode()
+        handler = make_handler(
+            "/admin/login",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+        with patch.object(app, "db", return_value=LockedConnection()):
+            app.Handler.do_POST(handler)
+
+        self.assertIn("503 Service Unavailable", handler.wfile.getvalue().decode("latin-1"))
+
     def test_comment_content_is_escaped_on_article_page(self):
         now = app.now_iso()
         self.conn.execute(
@@ -425,6 +679,132 @@ class SignalDeskTests(unittest.TestCase):
 
         row = self.conn.execute("SELECT content, reply, visible FROM comments WHERE id=?", (comment_id,)).fetchone()
         self.assertEqual((row["content"], row["reply"], row["visible"]), ("Edited", "已处理", 0))
+
+    def test_logout_requires_csrf_token(self):
+        token = "logout-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        handler = make_handler(
+            "/admin/logout",
+            b"",
+            {"Content-Length": "0", "Cookie": app.build_session_cookie(token)},
+        )
+
+        app.Handler.do_POST(handler)
+
+        self.assertIn("403 Forbidden", handler.wfile.getvalue().decode("latin-1"))
+        self.assertIn(token, app.SESSIONS)
+
+    def test_logout_with_csrf_token_revokes_session(self):
+        token = "logout-valid-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body = urlencode({"csrf": "integration-csrf"}).encode()
+        handler = make_handler(
+            "/admin/logout",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+
+        app.Handler.do_POST(handler)
+
+        self.assertIn("303 See Other", handler.wfile.getvalue().decode("latin-1"))
+        self.assertNotIn(token, app.SESSIONS)
+
+    def test_content_save_rejects_empty_required_fields(self):
+        token = "required-field-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body = urlencode(
+            {
+                "csrf": "integration-csrf",
+                "title": "",
+                "slug": "empty-title",
+                "excerpt": "",
+                "body": "Body",
+                "status": "draft",
+            }
+        ).encode()
+        handler = make_handler(
+            "/admin/posts/save",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+
+        app.Handler.do_POST(handler)
+
+        self.assertIn("400 Bad Request", handler.wfile.getvalue().decode("latin-1"))
+        self.assertIsNone(self.conn.execute("SELECT id FROM posts WHERE slug = 'empty-title'").fetchone())
+
+    def test_content_save_rejects_overlong_title(self):
+        token = "long-title-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body = urlencode(
+            {
+                "csrf": "integration-csrf",
+                "title": "x" * (app.MAX_TITLE_CHARS + 1),
+                "slug": "long-title",
+                "excerpt": "Excerpt",
+                "body": "Body",
+                "status": "draft",
+            }
+        ).encode()
+        handler = make_handler(
+            "/admin/posts/save",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+
+        app.Handler.do_POST(handler)
+
+        self.assertIn("400 Bad Request", handler.wfile.getvalue().decode("latin-1"))
+
+    def test_non_slug_integrity_error_gets_generic_message(self):
+        self.conn.execute(
+            "CREATE TRIGGER reject_post_insert BEFORE INSERT ON posts BEGIN SELECT RAISE(ABORT, 'forced integrity failure'); END"
+        )
+        self.conn.commit()
+        token = "integrity-session"
+        app.SESSIONS[token] = {"admin_id": "1", "csrf": "integration-csrf"}
+        body = urlencode(
+            {
+                "csrf": "integration-csrf",
+                "title": "Valid title",
+                "slug": "integrity-test",
+                "excerpt": "Excerpt",
+                "body": "Body",
+                "status": "draft",
+            }
+        ).encode()
+        handler = make_handler(
+            "/admin/posts/save",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+                "Cookie": app.build_session_cookie(token),
+            },
+        )
+
+        try:
+            app.Handler.do_POST(handler)
+        finally:
+            self.conn.execute("DROP TRIGGER reject_post_insert")
+            self.conn.commit()
+
+        response = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("409 Conflict", response)
+        self.assertIn("数据约束", response)
+        self.assertNotIn("slug 可能已经被使用", response)
 
     def test_admin_comments_uses_row_based_management_list(self):
         now = app.now_iso()

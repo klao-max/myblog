@@ -1069,6 +1069,28 @@ h1, h2, h3 { letter-spacing: -.055em; }
 }
 
 
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 28px 0 8px;
+}
+
+.pagination span {
+  margin-right: auto;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+@media (max-width: 560px) {
+  .pagination {
+    justify-content: space-between;
+  }
+}
+
+
 /* Blog background gallery */
 .blog-gallery {
   position: relative;

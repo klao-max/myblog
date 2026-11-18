@@ -85,6 +85,8 @@ docker compose -f compose.yaml down
 
 SQLite 和上传文件都存在 Docker volume `myblog_data` 中，重启容器不会丢失文章、项目、游戏元数据或图库图片。
 
+应用启动时会自动执行兼容性数据库迁移并启用 SQLite WAL。迁移失败会阻止应用进入可用状态，部署前仍应备份 `myblog_data`。Compose readiness 检查数据库查询和 `/data` 写入能力。
+
 图库文件也会持久化在同一个 volume：数据库位于 `/data/blog.db`，上传的背景图片位于 `/data/uploads/gallery/`。停止或重新创建容器时保留 `myblog_data` 即可保留图片；不要使用 `docker compose down -v`，因为该命令会删除 volume 及其中的数据库和上传文件。部署前请按自己的 Docker 运维流程备份 `myblog_data`。
 
 ## 管理首页背景图库
